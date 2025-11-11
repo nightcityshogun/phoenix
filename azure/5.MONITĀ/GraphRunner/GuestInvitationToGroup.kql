@@ -1,0 +1,35 @@
+let fromDate = 30d;  // Specify how many days ago to start the range
+let toDate = 0d;     // Use 0d to indicate "now"
+// Capture external user invites within the specified time range
+let ExternalUserInvites = AuditLogs
+| where TimeGenerated between (ago(fromDate) .. ago(toDate))
+| where OperationName == "Invite external user"
+| extend GuestUPN = tolower(tostring(TargetResources[0].userPrincipalName))
+| project InviteTime = TimeGenerated, GuestUPN;
+// Query for group management operations (adding members to groups) within the same time range
+let GroupMembershipChanges = AuditLogs
+| where TimeGenerated between (ago(fromDate) .. ago(toDate))
+| where Category == "GroupManagement"
+| where OperationName == "Add member to group"
+| where Result == "success"
+| mv-expand TargetResources
+| extend userPrincipalName = tolower(tostring(TargetResources.userPrincipalName))
+| mv-expand modifiedProperties = TargetResources.modifiedProperties
+| where modifiedProperties.displayName == "Group.DisplayName"
+| extend prevState = iif(isnull(modifiedProperties.oldValue) or modifiedProperties.oldValue == "", "null", tostring(modifiedProperties.oldValue)), 
+         addedTo = tostring(modifiedProperties.newValue)
+| extend InvitedBy = tostring(parse_json(InitiatedBy).user.userPrincipalName)
+| extend SourceIP = tostring(parse_json(InitiatedBy).user.ipAddress)
+| mv-expand AdditionalDetails
+| where AdditionalDetails.key == "User-Agent"
+| extend UserAgent = tostring(AdditionalDetails.value)
+| project TimeGenerated, InvitedBy, SourceIP, UserAgent, userPrincipalName, prevState, addedTo;
+// Join the two datasets on the userPrincipalName (or GuestUPN) and filter results
+ExternalUserInvites
+| join kind=inner (
+    GroupMembershipChanges
+) on $left.GuestUPN == $right.userPrincipalName
+| project TimeGenerated, InviteTime, InvitedBy, SourceIP, UserAgent, userPrincipalName, prevState, addedTo
+| order by TimeGenerated desc
+
+// (C) NightCityShogun 2024

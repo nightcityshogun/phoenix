@@ -1,0 +1,25 @@
+// Detect changes to the Domain Authentication Type from Managed to Federated which may indicate nefarious behavior with variable date range
+
+let startDate = ago(30d);  // Data from the last 30 days
+let endDate = now();       // Up to the current moment
+AuditLogs
+| where TimeGenerated between (startDate .. endDate)
+| where OperationName == "Set domain authentication"
+| extend Domain = tostring(TargetResources[0].displayName)
+| extend TenantID = extract("/tenants/([^/]+)/", 1, ResourceId)
+| extend ModifiedBy = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName)
+| extend SIPAddress = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress)
+| extend iProperties = parse_json(TargetResources[0].modifiedProperties)
+| mv-apply iProperties on (
+    where iProperties.displayName == "IssuerUri"
+    | extend Issuer = tostring(parse_json(tostring(iProperties.newValue))[0])
+)
+| extend iProperties = parse_json(TargetResources[0].modifiedProperties)
+| mv-apply iProperties on (
+    where iProperties.displayName == "LiveType"
+    | extend OldAuthType = tostring(parse_json(tostring(iProperties.oldValue))[0])
+    | extend NewAuthType = tostring(parse_json(tostring(iProperties.newValue))[0])
+)
+| project TimeGenerated, Domain, ModifiedBy, SIPAddress, Issuer, OldAuthType, NewAuthType
+
+// (C) NightCityShogun 2024

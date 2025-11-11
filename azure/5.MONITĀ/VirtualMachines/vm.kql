@@ -1,0 +1,16 @@
+AzureActivity
+| where TimeGenerated >= ago(180d)
+| where OperationNameValue in ("MICROSOFT.COMPUTE/VIRTUALMACHINES/CREATE", "MICROSOFT.COMPUTE/VIRTUALMACHINES/DELETE")
+| where ActivityStatusValue == "Success"
+| extend ParsedEntity = parse_json(Properties)
+| project
+    TimeGenerated,
+    VMName = tostring(ParsedEntity.resource),
+    Caller,
+    CallerIpAddress,
+    SubscriptionId = tostring(ParsedEntity.subscriptionId),
+    ResourceGroup = tostring(ParsedEntity.resourceGroup),
+    ActivityStatus = tostring(ParsedEntity.activityStatusValue),
+    Operation = OperationNameValue
+
+// (C) NightCityShogun 2024

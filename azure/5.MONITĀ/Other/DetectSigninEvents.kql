@@ -1,0 +1,29 @@
+let startDate = ago(30d);  // Data from the last 30 days
+let endDate = now();       // Up to the current moment
+SigninLogs
+| where TimeGenerated between (startDate .. endDate)
+| extend AuthDetails = parse_json(AuthenticationDetails)
+| extend AuthMethod = AuthDetails[0].authenticationMethod,
+         AuthStatus = AuthDetails[0].authenticationStepResultDetail,
+         Type = AuthDetails[0].authenticationStepRequirement
+| extend AuthProcessingDetails = parse_json(AuthenticationProcessingDetails)
+| extend LegacyTLS = AuthProcessingDetails[0].value,
+         CAEToken = AuthProcessingDetails[1].value
+| project TimeGenerated, 
+          AppDisplayName, 
+          UserPrincipalName, 
+          Identity, 
+          LegacyTLS, 
+          CAEToken, 
+          ResultType, 
+          AuthMethod, 
+          AuthStatus,
+          Type, 
+          TokenIssuerType,
+          ResultDescription, 
+          ConditionalAccessStatus,
+          UserAgent,
+          IPAddress,
+          Location
+
+// # (C) NightCityShogun 2024

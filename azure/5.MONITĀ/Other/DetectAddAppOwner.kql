@@ -1,0 +1,10 @@
+AuditLogs
+| where OperationName == "Add owner to application"
+| where TargetResources[0].type == "User"
+| extend Actor = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName)
+| extend ['Actor IP Address'] = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress)
+| extend Target = tostring(TargetResources[0].userPrincipalName)
+| extend ['Application Name'] = tostring(parse_json(tostring(parse_json(tostring(TargetResources[0].modifiedProperties))[1].newValue)))
+| extend ['Application ObjectId'] = tostring(TargetResources[1].id)
+| where isnotempty( Actor)
+| project TimeGenerated, OperationName, Actor, ['Actor IP Address'], Target, ['Application Name'], ['Application ObjectId']

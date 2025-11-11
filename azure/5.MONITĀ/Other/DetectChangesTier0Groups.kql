@@ -1,0 +1,63 @@
+// Additional Queries for identifying changes to Tier 0 Security Groups within an On-Premises AD Domain
+
+// Define the list of sensitive groups
+let Groups = dynamic(['Access Control Assistance Operators', 
+'Account Operators', 
+'Administrators',
+'Backup Operators',
+'Certificate Service DCOM Access',
+'Cert Publishers',
+'Cloneable Domain Controllers',
+'Cryptographic Operators',
+'DHCP Administrators',
+'Distributed COM Users',
+'DnsUpdateProxy',
+'DnsAdmins',
+'Domain Admins',
+'Domain Controllers',
+'Enterprise Admins',
+'Enterprise Key Admins',
+'Enterprise Read-only Domain Controllers',
+'Event Log Readers',
+'Group Policy Creator Owners',
+'Hyper-V Administrators',
+'IIS_IUSRS',
+'Incoming Forest Trust Builders',
+'Key Admins',
+'Network Configuration Operators',
+'Pre–Windows 2000 Compatible Access',
+'Print Operators',
+'Protected Users',
+'RAS and IAS Servers',
+'RDS Endpoint Servers',
+'RDS Management Servers',
+'RDS Remote Access Servers',
+'Read-only Domain Controllers',
+'Remote Desktop Users',
+'Remote Management Users',
+'Replicator',
+'Schema Admins',
+'Server Operators',
+'Storage Replica Administrators',
+'System Managed Accounts',
+'Terminal Server License Servers',
+'Windows Authorization Access',
+'WinRMRemoteWMIUsers_']);
+// Set the period for the query
+let Period = 30d;
+// Query IdentityDirectoryEvents with filters and extensions
+IdentityDirectoryEvents
+| where TimeGenerated > ago(Period)
+| where ActionType == "Group Membership changed"
+| extend 
+    Category = tostring(parse_json(AdditionalFields)['Category']),
+    MitreAttack = tostring(parse_json(AdditionalFields)['AttackTechniques']),
+    Group = tostring(parse_json(AdditionalFields)['TO.GROUP']),
+    InitiatedBy = tostring(parse_json(AdditionalFields)['ACTOR.ACCOUNT']),
+    NewMember = tostring(parse_json(AdditionalFields)['TARGET_OBJECT.USER'])
+| where Group in (Groups)
+| project TimeGenerated, Application, AccountDomain, Category, MitreAttack, ActionType, Group, NewMember, InitiatedBy, DestinationDeviceName
+| sort by Group asc 
+//| summarize GroupChangeCount = count() by Group
+
+// (C) NightCityShogun 2024

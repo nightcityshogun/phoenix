@@ -1,0 +1,15 @@
+// Additional Queries for identifying possible weak encryptiuon vulnerabilities within an On-Premises AD Domain
+
+IdentityLogonEvents
+| where Timestamp > ago(1d)
+| extend EncryptionType = AdditionalFields.EncryptionType
+| extend WeakEncryptionType = AdditionalFields.WeakEncryptionType
+| extend SrcDevice = DeviceName
+| extend DestDevice = DestinationDeviceName
+| where WeakEncryptionType == "Rc4"
+| project Timestamp, SrcDevice, DestDevice
+| summarize count() by bin(Timestamp, 30m), SrcDevice, DestDevice
+| order by Timestamp, count_ desc 
+
+// (C) NightCityShogun 2024
+

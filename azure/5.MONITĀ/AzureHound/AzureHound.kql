@@ -1,0 +1,39 @@
+// Fetch allowlist from an external data source or build it based on activity
+let DynamicAllowlist = ExternalData (ObjectId: string) [
+    h@"https://your-source-location-for-allowlist.csv" 
+    with (format="csv", ignoreFirstRecord=true)
+];
+let MinUniqueRequests = 1000; // Customize based on tenant size
+let MinTotalResponseSize = 1000000; // Customize based on tenant size
+let SensitiveResources = dynamic(["orgDetails", "groupInfo", "deviceDetails", "appDetails", "userProfiles", "roleManagement", "servicePrincipals"]);
+// Historical activity baseline for dynamic anomaly detection
+let HistoricalActivity = GraphActivityLogs
+| where RequestMethod == "GET" and ResponseStatusCode == 200
+| extend ParsedUri = parse_url(RequestUri).Path
+| extend CleanedApiPath = tostring(tolower(replace_string(ParsedUri, "//", "/")))
+| extend ResourceAccessed = tostring(split(CleanedApiPath, "/")[2])
+| where ResourceAccessed in (SensitiveResources)
+| summarize avgRequests = avg(dcount(RequestId)), avgResponseSize = avg(sum(ResponseSizeBytes)) by bin(TimeGenerated, 1h), ObjectId;
+// Current Activity Logs
+GraphActivityLogs
+| where RequestMethod == "GET" and ResponseStatusCode == 200
+| extend ParsedUri = parse_url(RequestUri).Path
+| extend CleanedApiPath = tostring(tolower(replace_string(ParsedUri, "//", "/")))
+| extend ResourceAccessed = tostring(split(CleanedApiPath, "/")[2])
+| where ResourceAccessed in (SensitiveResources)
+| extend ActorId = coalesce(UserId, ServicePrincipalId)
+| join kind=leftanti (DynamicAllowlist) on ActorId
+| summarize TotalResponseSizeBytes = sum(ResponseSizeBytes), 
+            UniqueRequestCount = dcount(RequestId), 
+            SampleRequestUri = take_any(RequestUri), 
+            AccessedPaths = make_set(CleanedApiPath), 
+            AccessedResources = make_set(ResourceAccessed), 
+            UniqueResourceTypes = dcount(ResourceAccessed) 
+            by ActorId, bin(TimeGenerated, 1h), UserAgent, ActorId
+| join kind=leftouter (HistoricalActivity) on ActorId
+| extend AnomalousRequestActivity = iff(UniqueRequestCount > 1.5 * avgRequests, "Anomalous", "Normal"),
+         AnomalousResponseSize = iff(TotalResponseSizeBytes > 1.5 * avgResponseSize, "Anomalous", "Normal")
+| where UniqueRequestCount >= MinUniqueRequests or TotalResponseSizeBytes >= MinTotalResponseSize
+| project TimeGenerated, ActorId, UserAgent, UniqueRequestCount, TotalResponseSizeBytes, UniqueResourceTypes, AccessedPaths, AccessedResources, SampleRequestUri, AnomalousRequestActivity, AnomalousResponseSize
+
+// (C) NightCityShogun 2024

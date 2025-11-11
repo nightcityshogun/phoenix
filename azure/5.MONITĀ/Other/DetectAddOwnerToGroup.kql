@@ -1,0 +1,9 @@
+AuditLogs
+| where OperationName == "Add owner to group"
+| extend GroupName = tostring(parse_json(tostring(parse_json(tostring(TargetResources[0].modifiedProperties))[1].newValue)))
+| extend Actor = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName)
+| extend ['Actor IP Address'] = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress)
+| where TargetResources[0].type == "User"
+| extend Target = tostring(TargetResources[0].userPrincipalName)
+| where GroupName in~ ("PrivilegedGroup1","PrivilegedGroup2")
+| project TimeGenerated, OperationName, Actor, ['Actor IP Address'], Target, GroupName

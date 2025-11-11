@@ -1,0 +1,38 @@
+let fromDate = 30d;  // Specify how many days ago to start the range
+let toDate = 0d;     // Use 0d to indicate "now"
+let userUPN = "user@domain.com";  // Replace with the user-supplied UPN
+AuditLogs
+| where TimeGenerated between (ago(fromDate) .. ago(toDate))
+| where OperationName == "Add application"
+| extend AppName = tostring(TargetResources[0].displayName)
+| extend CreatedBy = tostring(parse_json(tostring(InitiatedBy.user)).userPrincipalName)
+| extend SourceIP = tostring(parse_json(tostring(InitiatedBy.user)).ipAddress)
+| where CreatedBy == userUPN  // Filter by the user-supplied UPN
+| extend TargetResourcesStr = tostring(TargetResources)
+| mv-expand mp = TargetResources[0].modifiedProperties  // Expand the modifiedProperties array
+| extend displayName = tostring(mp.displayName), addrValue = tostring(mp.newValue)
+| where displayName == "AppAddress" or displayName == "AppId" or displayName == "PublisherDomain" or displayName == "RequiredResourceAccess"
+| extend addrJson = iff(displayName == "AppAddress", parse_json(addrValue), dynamic(null))
+| extend appId = iff(displayName == "AppId", tostring(parse_json(addrValue)[0]), "")
+| extend publisherDomain = iff(displayName == "PublisherDomain", tostring(parse_json(addrValue)[0]), "")
+| extend requiredResourceAccess = iff(displayName == "RequiredResourceAccess", parse_json(addrValue), dynamic(null))
+| summarize 
+    AppAddressJson = any(addrJson), 
+    AppId = any(appId), 
+    PublisherDomain = any(publisherDomain),
+    RequiredResourceAccessList = make_list(requiredResourceAccess),
+    TimeGenerated = any(TimeGenerated),  // Include TimeGenerated in the summarize operation
+    AppName = any(AppName), 
+    CreatedBy = any(CreatedBy), 
+    SourceIP = any(SourceIP),
+    TargetResourcesStr = any(TargetResourcesStr)
+| mv-expand RequiredResourceAccess = RequiredResourceAccessList  // Expand the RequiredResourceAccess after summarization
+| mv-expand entitlement = RequiredResourceAccess.RequiredAppPermissions  // Expand the RequiredAppPermissions array to get EntitlementIds
+| extend EntitlementId = tostring(entitlement.EntitlementId)
+| where isnotempty(EntitlementId)  // Ensure only non-empty EntitlementIds are included
+| summarize EntitlementIds = make_list(EntitlementId) by TimeGenerated, AppName, CreatedBy, SourceIP, AppId, tostring(AppAddressJson), PublisherDomain, TargetResourcesStr
+| extend AppAddressDetails = parse_json(tostring(AppAddressJson))[0]  // Convert AppAddressJson back to dynamic and extract the first element
+| evaluate bag_unpack(AppAddressDetails)  // Unpack the AppAddressDetails JSON bag into individual columns
+| project TimeGenerated, CreatedBy, AppName, SourceIP, AppId, Address, ReplyAddressClientType, IsReplyAddressDefault, PublisherDomain, EntitlementIds, TargetResourcesStr
+
+// (C) NightCityShogun 2024

@@ -1,0 +1,49 @@
+let TimeFrame = 10d; // Detection Window
+let TZ = -7; // Define timezone conversion in hours as an integer (e.g., -7 for MST)
+let IntuneApp = "9ba1a5c7-f17a-4de9-a1f1-6178c8d51223"; // Intune Company Portal Client ID
+let MicrosoftGraph = "00000003-0000-0000-c000-000000000000"; // Microsoft Graph Resource Identity
+let SignInData = 
+    union AADNonInteractiveUserSignInLogs, SigninLogs, DeviceLogonEvents
+    | where TimeGenerated >= ago(TimeFrame)
+    | where tolower(AppId) == tolower(IntuneApp) // TokenSmith Known IOC App ID
+    | where ResourceIdentity == MicrosoftGraph // TokenSmith Known IOC Resource Identity
+    | extend AuthDetails = parse_json(AuthenticationDetails)
+    | mv-expand AuthDetails // Expand the array of policies
+    | extend Method = parse_json(AuthDetails.authenticationMethod),
+             Succeeded = parse_json(AuthDetails.succeeded),
+             Result = parse_json(AuthDetails.authenticationStepResultDetail),
+             Authentication = parse_json(AuthDetails.authenticationStepRequirement)
+    | where Result contains "MFA requirement satisfied by claim in the token"
+    | extend CAP = parse_json(ConditionalAccessPolicies_string)
+    | mv-expand CAP // Expand the array of policies
+    | extend PolicyName = trim_start(@"^\d+\. ", tostring(CAP.displayName))
+    | extend DeviceDetail = parse_json(DeviceDetail_string),
+             LocationDetail = parse_json(LocationDetails_string)
+    | extend DeviceId = parse_json(DeviceDetail.deviceId), 
+             DeviceName = tostring(DeviceDetail.displayName),
+             Compliant = tostring(DeviceDetail.isCompliant),
+             OperatingSystem = tostring(DeviceDetail.operatingSystem),
+             Browser = tostring(DeviceDetail.browser),
+             Managed = tostring(DeviceDetail.isManaged),
+             TrustType = tostring(DeviceDetail.trustType),
+             AppId = tostring(AppId),
+             Resource = tostring(ResourceIdentity)
+| where Compliant != "true" and Managed != "true"
+| where not(OperatingSystem has_any ("Android", "Ios"))
+| where ResultType == 0;
+// Aggregate results by IPAddress
+SignInData
+| summarize 
+    FirstSeen = min(datetime_add('hour', TZ, todatetime(TimeGenerated))),
+    LastSeen = max(datetime_add('hour', TZ, todatetime(TimeGenerated))),
+    Policies = make_set(PolicyName),
+    Results = make_set(Result),
+    Locations = make_set(Location),
+    Methods = make_set(Method),
+    UserPrincipalNames = make_set(UserPrincipalName),
+    ResourceIdentities = make_set(ResourceIdentity),
+    Apps = make_set(AppId)
+    by IPAddress
+| project IPAddress, FirstSeen, LastSeen, Policies, Results, Locations, Methods, UserPrincipalNames, ResourceIdentities, Apps
+
+// (C) NightCityShogun 2024

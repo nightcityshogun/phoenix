@@ -1,0 +1,78 @@
+let StartTime = ago(14d);
+let EndTime = now();
+let Signon = 
+   WindowsEvent
+   | where TimeGenerated between (StartTime .. EndTime)
+   | where EventID == 4624
+   | extend EventDataJson = parse_json(EventData)
+   | extend 
+       LogonTime = TimeGenerated,
+       SubjectUserName = tostring(toupper(EventDataJson.SubjectUserName)), 
+       SubjectDomainName = tostring(EventDataJson.SubjectDomainName),
+       SubjectUserSid = tostring(EventDataJson.SubjectUserSid),
+       SubjectLogonId = tostring(EventDataJson.SubjectLogonId),
+       TargetUserName = tostring(toupper(EventDataJson.TargetUserName)), 
+       TargetDomainName = tostring(EventDataJson.TargetDomainName),
+       TargetLogonId = tostring(EventDataJson.TargetLogonId),
+       LogonType = tostring(EventDataJson.LogonType),
+       WorkstationName = tostring(EventDataJson.WorkstationName),
+       LogonGuid = tostring(EventDataJson.LogonGuid),
+       LogonProcessName = tostring(EventDataJson.LogonProcessName),
+       IPAddress = tostring(EventDataJson.IpAddress),
+       AuthenticationPackageName = tostring(EventDataJson.AuthenticationPackageName)
+   | where (isempty(SubjectDomainName) or SubjectDomainName has "-") 
+   | where TargetDomainName contains "." 
+   | where isnotempty(TargetUserName) and TargetUserName !contains "$"
+   | project LogonTime, SubjectUserName, SubjectDomainName, SubjectUserSid, SubjectLogonId, TargetUserName, TargetDomainName, TargetLogonId, LogonType, WorkstationName, LogonGuid, LogonProcessName, IPAddress, AuthenticationPackageName;
+let TicketReq = 
+   WindowsEvent
+   | where TimeGenerated between (StartTime .. EndTime)
+   | where EventID == 4769
+   | extend EventDataJson = parse_json(EventData)
+   | extend 
+       TicketReqTime = TimeGenerated,
+       TargetUserName = tostring(toupper(EventDataJson.TargetUserName)), 
+       TargetDomainName = tostring(EventDataJson.TargetDomainName),
+       TargetSid = tostring(EventDataJson.TargetSid),
+       ServiceName = tostring(EventDataJson.ServiceName),
+       ServiceSid = tostring(EventDataJson.ServiceSid),
+       TicketOptions = tostring(EventDataJson.TicketOptions),
+       TicketEncryptionType = tostring(EventDataJson.TicketEncryptionType),
+       LogonGuid2 = tostring(EventDataJson.LogonGuid),
+       Status = tostring(EventDataJson.Status),
+       PreAuthType = tostring(EventDataJson.PreAuthType),
+       IpAddress = tostring(EventDataJson.IpAddress)
+   | where isnotempty(TargetUserName) and TargetUserName !contains "$";
+let SignonWithTicketReq = 
+   Signon
+   | join kind=inner (
+       TicketReq
+       | project TargetUserName, TicketReqTime, LogonGuid2
+   ) on TargetUserName
+   | where abs(datetime_diff('second', LogonTime, TicketReqTime)) <= 4 and LogonGuid != LogonGuid2;
+let SignonWithoutTicketReq = 
+   Signon
+   | join kind=anti TicketReq on TargetUserName;
+let Signoff = 
+   WindowsEvent
+   | where TimeGenerated between (StartTime .. EndTime)
+   | where EventID == 4634
+   | extend EventDataJson = parse_json(EventData)
+   | extend 
+       LogoffTime = TimeGenerated,
+       TargetUserName = tostring(toupper(EventDataJson.TargetUserName)), 
+       TargetDomainName = tostring(EventDataJson.TargetDomainName),
+       TargetLogonId = tostring(EventDataJson.TargetLogonId),
+       LogonType = tostring(EventDataJson.LogonType)
+   | where isnotempty(TargetUserName) and TargetUserName !contains "$";
+let Session = 
+   SignonWithoutTicketReq
+   | join kind=inner Signoff on TargetLogonId
+   | project-away TargetUserName1
+   | extend SessionDuration = LogoffTime - LogonTime
+   | project LogonTime, LogoffTime, SessionDuration, SubjectLogonId, TargetUserName, TargetDomainName, TargetLogonId, LogonType, IPAddress, LogonGuid;
+Session
+| where TargetDomainName matches regex "[a-z]"
+| project LogonTime, LogoffTime, SessionDuration, ExposedId = TargetUserName, TargetDomainName, LogonType
+
+// (C) NightCityShogun 2024
