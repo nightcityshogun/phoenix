@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
 Resets inter/intra-forest trust passwords (or deletes orphaned trusts) using DCs from an isolated recovery inventory.
+
 .DESCRIPTION
 Invoke-TrustPasswordReset discovers Trusted Domain Objects (TDOs) per domain (Forest Root → Child → Tree), prefers the PDC
 for operations, and:
@@ -9,23 +10,30 @@ for operations, and:
 - Verifies inter-domain trust accounts (CN=Users\<NetBIOS$>) are removed after TDO deletion.
 - Validates trust reset via \\TrustedDomain\NETLOGON access.
 Runs in WhatIf mode unless -Execute is supplied. Requires Domain/Enterprise Admin privileges.
+
 .PARAMETER IsolatedDCList
 Inventory of ONLINE DCs (FQDN, Domain, DefaultNamingContext, ConfigurationNamingContext, Type, IsPdcRoleOwner, Online).
+
 .PARAMETER Execute
 Apply changes; omit to simulate (WhatIf=True).
+
 .EXAMPLE
 # Simulate full trust sweep and report actions
 Invoke-TrustPasswordReset -IsolatedDCList $dcs
+
 .EXAMPLE
 # Apply: delete orphans, verify CN=Users\<NetBIOS$> trust accounts are gone, reset valid trust passwords
 Invoke-TrustPasswordReset -IsolatedDCList $dcs -Execute
+
 .OUTPUTS
 Writes a summary to the log; increments counters: Passwords Reset, Trusts Deleted, Trust Accounts Cleaned, Errors.
+
 .NOTES
 Author: NightCityShogun
 Version: 2.2.1 (verify-only trust account cleanup; NetLogon validation restored; robust counters; multi-tier safe)
 Requires: Domain/Enterprise Admin rights; ADSI; .NET DirectoryServices.
 SupportsShouldProcess: True
+
 © 2025 NightCityShogun. All rights reserved.
 #>
 function Invoke-TrustPasswordReset {
