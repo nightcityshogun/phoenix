@@ -39,15 +39,15 @@
 
 .NOTES
   Author: NightCityShogun
-  Version: 3.0.1 (flatName→SAM$ normalization; server-pinned NETLOGON verify)
+  Version: 3.0.2 (fix single-pair .Count bug; defensive collection normalization)
   Requires: Domain/Enterprise Admin rights; ADSI; .NET DirectoryServices
   SupportsShouldProcess: True
   © 2025 NightCityShogun. All rights reserved.
 #>
 function Invoke-TrustPasswordReset {
-  [CmdletBinding(SupportsShouldProcess=$true)]
+  [CmdletBinding(SupportsShouldProcess = $true)]
   param(
-    [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
+    [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
     [psobject[]]$IsolatedDCList,
 
     [Parameter()]
@@ -65,13 +65,20 @@ function Invoke-TrustPasswordReset {
 
     # ---- Helper shims (if not provided by the host) ----
     if (-not (Get-Command Write-IdentIRLog -ErrorAction SilentlyContinue)) {
-      function Write-IdentIRLog { param([string]$Message,[string]$TypeName='Info',[string]$ForegroundColor='White')
+      function Write-IdentIRLog {
+        param(
+          [string]$Message,
+          [string]$TypeName       = 'Info',
+          [string]$ForegroundColor = 'White'
+        )
         $prefix = "[$TypeName]"
         Write-Host "$prefix $Message" -ForegroundColor $ForegroundColor
       }
     }
+
     if (-not (Get-Command New-Password -ErrorAction SilentlyContinue)) {
-      function New-Password { param([int]$Length=24)
+      function New-Password {
+        param([int]$Length = 24)
         $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*()-_=+[]{}' -split ''
         $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
         $bytes = New-Object byte[] ($Length)
@@ -154,23 +161,41 @@ function Invoke-TrustPasswordReset {
       [string]$p.FQDN
     }
 
-    function Pair-Key { param([string]$A,[string]$B)
-      $a = Normalize-DomainName $A; $b = Normalize-DomainName $B
-      if ([string]::Compare($a,$b,[StringComparison]::Ordinal) -le 0) { "$a|$b" } else { "$b|$a" }
+    function Pair-Key {
+      param([string]$A, [string]$B)
+      $a = Normalize-DomainName $A
+      $b = Normalize-DomainName $B
+      if ([string]::Compare($a, $b, [StringComparison]::Ordinal) -le 0) { "$a|$b" } else { "$b|$a" }
     }
 
     function Is-Suffix {
-      param([string]$A,[string]$B) # is A child of B?
+      param([string]$A, [string]$B) # is A child of B?
       if (-not $A -or -not $B) { return $false }
       if ($A -ieq $B) { return $false }
       return $A.EndsWith(".$B", [System.StringComparison]::OrdinalIgnoreCase)
     }
 
-    function TrustType-String { param([int]$t)
-      switch ($t) { 1{'TRUST_TYPE_DOWNLEVEL'} 2{'TRUST_TYPE_UPLEVEL'} 3{'TRUST_TYPE_MIT'} 4{'TRUST_TYPE_DCE'} 5{'TRUST_TYPE_AAD'} default{"Unknown ($t)"} }
+    function TrustType-String {
+      param([int]$t)
+      switch ($t) {
+        1 { 'TRUST_TYPE_DOWNLEVEL' }
+        2 { 'TRUST_TYPE_UPLEVEL'   }
+        3 { 'TRUST_TYPE_MIT'       }
+        4 { 'TRUST_TYPE_DCE'       }
+        5 { 'TRUST_TYPE_AAD'       }
+        default { "Unknown ($t)"   }
+      }
     }
-    function TrustDir-String { param([int]$d)
-      switch ($d) { 0{'Disabled'} 1{'Inbound'} 2{'Outbound'} 3{'Bidirectional'} default{"Unknown ($d)"} }
+
+    function TrustDir-String {
+      param([int]$d)
+      switch ($d) {
+        0 { 'Disabled'      }
+        1 { 'Inbound'       }
+        2 { 'Outbound'      }
+        3 { 'Bidirectional' }
+        default { "Unknown ($d)" }
+      }
     }
 
     function Remove-OrphanLocalSide {
@@ -182,7 +207,8 @@ function Invoke-TrustPasswordReset {
         [Parameter(Mandatory)][string]$TdoDN,
         [Parameter()][string]$FlatName
       )
-      $tdoDeleted = $false; $acctCleaned = $false
+      $tdoDeleted = $false
+      $acctCleaned = $false
 
       # Delete local-side TDO (server-pinned)
       try {
@@ -207,7 +233,8 @@ function Invoke-TrustPasswordReset {
               Write-IdentIRLog -Message "WhatIf: Would delete TDO at $TdoDN" -TypeName 'Info' -ForegroundColor White
               $tdoDeleted = $true
             } else {
-              $obj.DeleteTree(); $obj.CommitChanges()
+              $obj.DeleteTree()
+              $obj.CommitChanges()
               Write-IdentIRLog -Message "Deleted TDO at $TdoDN (fallback)" -TypeName 'Info' -ForegroundColor Green
               $tdoDeleted = $true
             }
@@ -245,7 +272,8 @@ function Invoke-TrustPasswordReset {
             } else {
               try {
                 $acct = [ADSI]("LDAP://$AnchorDC/$acctDn")
-                $acct.DeleteTree(); $acct.CommitChanges()
+                $acct.DeleteTree()
+                $acct.CommitChanges()
                 Write-IdentIRLog -Message "Deleted orphaned trust account: $acctSam" -TypeName 'Info' -ForegroundColor Green
                 $acctCleaned = $true
               } catch {
@@ -257,6 +285,7 @@ function Invoke-TrustPasswordReset {
       } catch {
         Write-IdentIRLog -Message ("Error verifying trust account: {0}" -f $_.Exception.Message) -TypeName 'Error' -ForegroundColor Red
       }
+
       return $tdoDeleted, $acctCleaned
     }
   }
@@ -278,19 +307,23 @@ function Invoke-TrustPasswordReset {
       if (-not $dc.Type) { $dc.Type = 'Unknown' }
       if (-not $dc.FQDN -or -not $dc.DefaultNamingContext) {
         Write-IdentIRLog -Message ("Invalid DC data - FQDN={0}, DefaultNC={1}" -f $dc.FQDN, $dc.DefaultNamingContext) -TypeName 'Warning' -ForegroundColor Yellow
-        $dc.Online = $false; $errors++; continue
+        $dc.Online = $false
+        $errors++
+        continue
       }
       try {
         Test-ServerConnectivity -ServerFqdn $dc.FQDN | Out-Null
         Write-IdentIRLog -Message ("Connectivity OK to {0} for domain {1}" -f $dc.FQDN, $dc.Domain) -TypeName 'Info' -ForegroundColor Green
       } catch {
         Write-IdentIRLog -Message ("Connectivity failed for {0}: {1}" -f $dc.FQDN, $_.Exception.Message) -TypeName 'Warning' -ForegroundColor Yellow
-        $dc.Online = $false; $errors++; continue
+        $dc.Online = $false
+        $errors++
+        continue
       }
     }
 
-    $onlineDCs = $IsolatedDCList | Where-Object { $_.Online -eq $true }
-    if (-not $onlineDCs) { throw 'No ONLINE DCs provided.' }
+    $onlineDCs = @($IsolatedDCList | Where-Object { $_.Online -eq $true })
+    if (-not $onlineDCs -or $onlineDCs.Count -eq 0) { throw 'No ONLINE DCs provided.' }
 
     # Group by domain
     $domainGroups = @{}
@@ -306,13 +339,14 @@ function Invoke-TrustPasswordReset {
         Depth     = $depth
       }
     }
+
     foreach ($dc in $onlineDCs) { $domainGroups[$dc.Domain].DCs += ,$dc }
 
     # Determine forest root via any DC's RootDSE (server-pinned)
     $first = $onlineDCs | Select-Object -First 1
     try {
       $rootdse = Get-RootDSE -ServerFqdn $first.FQDN
-      $ForestRootFqdn = Normalize-DomainName ([string]$rootdse.rootDomainNamingContext -replace '^DC=','' -replace ',DC=','.')
+      $ForestRootFqdn = Normalize-DomainName ([string]$rootdse.rootDomainNamingContext -replace '^DC=', '' -replace ',DC=', '.')
       if (-not $ForestRootFqdn) { throw 'Unable to derive forest root from RootDSE' }
       Write-IdentIRLog -Message ("Forest root (derived via {0}): {1}" -f $first.FQDN, $ForestRootFqdn) -TypeName 'Info' -ForegroundColor White
     } catch {
@@ -327,7 +361,7 @@ function Invoke-TrustPasswordReset {
     Write-IdentIRLog -Message ("Domain processing order: {0}" -f ($orderedDomainsForEnum -join ', ')) -TypeName 'Info' -ForegroundColor Cyan
 
     function Get-RelationshipType {
-      param([string]$Local,[string]$Partner,[int]$TrustAttributes)
+      param([string]$Local, [string]$Partner, [int]$TrustAttributes)
       $WITHIN_FOREST = 0x00000020
       $FOREST_TRANS  = 0x00000008
       $intraForest = ($TrustAttributes -band $WITHIN_FOREST) -ne 0
@@ -369,24 +403,24 @@ function Invoke-TrustPasswordReset {
         $localDepth  = $grp.Depth
         $remoteDepth = if ($domainGroups.ContainsKey($partnerDns)) { $domainGroups[$partnerDns].Depth } else { ($partnerDns -split '\.').Count }
         $allTrustObjects += [pscustomobject]@{
-          LocalDomain     = $localDns
-          TrustedDomain   = $partnerDns
-          FlatName        = $flat
-          CN              = $cn
-          DN              = $dn
-          Server          = $server
-          LocalDefaultNC  = $defaultNC
-          TrustType       = $trustType
-          TrustTypeString = (TrustType-String $trustType)
-          TrustDirection  = $trustDir
-          DirectionString = (TrustDir-String $trustDir)
-          TrustAttributes = $trustAttr
-          RelationshipType= $relType
-          IsWithinForest  = (($trustAttr -band 0x20) -ne 0)
-          IsInternal      = $isInternal
-          Action          = $action
-          LocalDepth      = $localDepth
-          RemoteDepth     = $remoteDepth
+          LocalDomain      = $localDns
+          TrustedDomain    = $partnerDns
+          FlatName         = $flat
+          CN               = $cn
+          DN               = $dn
+          Server           = $server
+          LocalDefaultNC   = $defaultNC
+          TrustType        = $trustType
+          TrustTypeString  = (TrustType-String $trustType)
+          TrustDirection   = $trustDir
+          DirectionString  = (TrustDir-String $trustDir)
+          TrustAttributes  = $trustAttr
+          RelationshipType = $relType
+          IsWithinForest   = (($trustAttr -band 0x20) -ne 0)
+          IsInternal       = $isInternal
+          Action           = $action
+          LocalDepth       = $localDepth
+          RemoteDepth      = $remoteDepth
         }
       }
     }
@@ -409,9 +443,19 @@ function Invoke-TrustPasswordReset {
         $trustAcctCleaned++
         continue
       }
-      $tdoDeleted = $false; $acctCleaned = $false
+
+      $tdoDeleted = $false
+      $acctCleaned = $false
       $expectedFlat = if ($tdo.FlatName) { $tdo.FlatName } else { $tdo.TrustedDomain.Split('.')[0].ToUpper() }
-      $tdoDeleted, $acctCleaned = Remove-OrphanLocalSide -AnchorDC $tdo.Server -LocalDomain $tdo.LocalDomain -LocalDefaultNC $tdo.LocalDefaultNC -TrustedDomain $tdo.TrustedDomain -TdoDN $tdo.DN -FlatName $expectedFlat
+
+      $tdoDeleted, $acctCleaned = Remove-OrphanLocalSide `
+        -AnchorDC $tdo.Server `
+        -LocalDomain $tdo.LocalDomain `
+        -LocalDefaultNC $tdo.LocalDefaultNC `
+        -TrustedDomain $tdo.TrustedDomain `
+        -TdoDN $tdo.DN `
+        -FlatName $expectedFlat
+
       if ($tdoDeleted) { $deletes++ } else { $errors++ }
       if ($acctCleaned) { $trustAcctCleaned++ }
     }
@@ -419,7 +463,8 @@ function Invoke-TrustPasswordReset {
     # --- Resets (paired, ordered) ---
     if ($domainGroups.Count -gt 1) {
       $trustPairs = @{}
-      $resetTDOs  = $allTrustObjects | Where-Object { $_.Action -eq 'Reset Password' }
+      $resetTDOs  = @($allTrustObjects | Where-Object { $_.Action -eq 'Reset Password' })
+
       foreach ($tdo in $resetTDOs) {
         $pairKey = Pair-Key $tdo.LocalDomain $tdo.TrustedDomain
         if (-not $trustPairs.ContainsKey($pairKey)) { $trustPairs[$pairKey] = @{ TDOs = @() } }
@@ -428,14 +473,19 @@ function Invoke-TrustPasswordReset {
 
       $processedPairs = @()
       foreach ($pairKey in $trustPairs.Keys) {
-        $tdos = $trustPairs[$pairKey].TDOs
+        $tdos = @($trustPairs[$pairKey].TDOs)
         if ($tdos.Count -lt 2) {
           Write-IdentIRLog -Message ("Warning: Only one side of trust found for {0}" -f $pairKey) -TypeName 'Warning' -ForegroundColor Yellow
           continue
         }
-        $tdo1 = $tdos[0]; $tdo2 = $tdos[1]
-        $trustingDomain = $null; $trustedDomain = $null
-        $trustingAnchor = $null; $trustedAnchor = $null
+
+        $tdo1 = $tdos[0]
+        $tdo2 = $tdos[1]
+        $trustingDomain = $null
+        $trustedDomain  = $null
+        $trustingAnchor = $null
+        $trustedAnchor  = $null
+
         if ($tdo1.TrustDirection -eq 2 -and $tdo2.TrustDirection -eq 1) {
           $trustingDomain = $tdo1.LocalDomain; $trustedDomain = $tdo1.TrustedDomain
           $trustingAnchor = $tdo1.Server;      $trustedAnchor = $tdo2.Server
@@ -454,27 +504,32 @@ function Invoke-TrustPasswordReset {
           Write-IdentIRLog -Message ("Warning: Unexpected trust direction combination for {0}" -f $pairKey) -TypeName 'Warning' -ForegroundColor Yellow
           continue
         }
+
         $minDepth = [Math]::Min($tdo1.LocalDepth, $tdo2.LocalDepth)
         $processedPairs += [pscustomobject]@{
-          TrustingDomain = $trustingDomain
-          TrustedDomain  = $trustedDomain
-          TrustingAnchor = $trustingAnchor
-          TrustedAnchor  = $trustedAnchor
-          MinDepth       = $minDepth
+          TrustingDomain   = $trustingDomain
+          TrustedDomain    = $trustedDomain
+          TrustingAnchor   = $trustingAnchor
+          TrustedAnchor    = $trustedAnchor
+          MinDepth         = $minDepth
           RelationshipType = $tdo1.RelationshipType
         }
       }
 
       # Simple, stable ordering: IntraDomain first, then External
-      $sortedPairs = $processedPairs | Sort-Object { if ($_.RelationshipType -eq 'IntraDomain') { 'A' } else { 'B' } }
+      $sortedPairs = @(
+        $processedPairs | Sort-Object { if ($_.RelationshipType -eq 'IntraDomain') { 'A' } else { 'B' } }
+      )
 
       Write-IdentIRLog -Message ("Processing {0} trust pairs (server-pinned updates)..." -f $sortedPairs.Count) -TypeName 'Info' -ForegroundColor Cyan
 
       foreach ($pair in $sortedPairs) {
         if ($whatIfMode) {
           Write-IdentIRLog -Message ("WhatIf: Would reset trust {0} <-> {1}" -f $pair.TrustingDomain, $pair.TrustedDomain) -TypeName 'Info' -ForegroundColor White
-          $resets++; continue
+          $resets++
+          continue
         }
+
         Write-IdentIRLog -Message ("Resetting trust: {0} <-> {1} [{2}]" -f $pair.TrustingDomain, $pair.TrustedDomain, $pair.RelationshipType) -TypeName 'Info' -ForegroundColor Cyan
         try {
           $pw = New-Password -Length 24
