@@ -1087,11 +1087,8 @@ function Invoke-WinUI {
                             }
                         }
                         'GMSA Account Rotation' {
-                            $groups = $dcs | Group-Object Domain
-                            foreach ($group in $groups) {
-                                Set-GMSA -IsolatedDCList $group.Group -Execute:$script:whatIfToggle.IsChecked
-                            }
-                        }
+    Set-GMSA -IsolatedDCList $dcs -Execute:$script:whatIfToggle.IsChecked
+}
                         'Krbtgt Password Reset' {
                             $groups = $dcs | Group-Object Domain
                             foreach ($group in $groups) {
