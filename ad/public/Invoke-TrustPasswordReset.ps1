@@ -63,30 +63,6 @@ function Invoke-TrustPasswordReset {
     $whatIfMode = -not $Execute
     $modeText   = if ($whatIfMode) { 'WhatIf=True' } else { 'WhatIf=False' }
 
-    # ---- Helper shims (if not provided by the host) ----
-    if (-not (Get-Command Write-IdentIRLog -ErrorAction SilentlyContinue)) {
-      function Write-IdentIRLog {
-        param(
-          [string]$Message,
-          [string]$TypeName       = 'Info',
-          [string]$ForegroundColor = 'White'
-        )
-        $prefix = "[$TypeName]"
-        Write-Host "$prefix $Message" -ForegroundColor $ForegroundColor
-      }
-    }
-
-    if (-not (Get-Command New-Password -ErrorAction SilentlyContinue)) {
-      function New-Password {
-        param([int]$Length = 24)
-        $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*()-_=+[]{}' -split ''
-        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-        $bytes = New-Object byte[] ($Length)
-        $rng.GetBytes($bytes)
-        -join ($bytes | ForEach-Object { $chars[ $_ % $chars.Count ] })
-      }
-    }
-
     Write-IdentIRLog -Message "Starting Trust Password Reset ($modeText)" -TypeName 'Info' -ForegroundColor White
 
     # ---- Privilege check: use token SIDs (robust across domains and host types) ----
