@@ -1167,3 +1167,146 @@ function Invoke-WinUI {
     [void]$form.ShowDialog()
     $form = $null
 }
+
+function Set-CurrentPassword {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param (
+        [System.Management.Automation.PSCredential] $Credential,
+        [switch] $Execute,
+        [SecureString] $Password
+    )
+    $oldConfirm = $script:ConfirmPreference
+    $script:ConfirmPreference = 'None'
+    $oldWhatIf = $WhatIfPreference
+    $WhatIfPreference = -not [bool]$Execute
+    try {
+        $ErrorActionPreference = 'Stop'
+        Set-StrictMode -Version Latest
+        # Current session identity
+        $currentUsername = $env:USERNAME
+        if (-not $currentUsername) {
+            Write-IdentIRLog -Message 'Unable to determine the currently logged-on username.' -TypeName 'Error' -ForegroundColor Red
+            return $false
+        }
+        # Authenticating DC (LOGONSERVER)
+        $logonServerNetBIOS = $env:LOGONSERVER -replace '^\\\\',''
+        if (-not $logonServerNetBIOS) {
+            Write-IdentIRLog -Message 'Unable to determine the authenticating domain controller (LOGONSERVER).' -TypeName 'Error' -ForegroundColor Red
+            return $false
+        }
+        # FQDN (fallback to NetBIOS)
+        try { $logonServerFQDN = [System.Net.Dns]::GetHostEntry($logonServerNetBIOS).HostName }
+        catch { $logonServerFQDN = $logonServerNetBIOS; Write-IdentIRLog -Message "FQDN resolution failed for '$logonServerNetBIOS'; using NetBIOS." -TypeName 'Warning' -ForegroundColor Yellow }
+        # RootDSE: ensure sync; get domain DN
+        $rootDSEPath = "LDAP://$logonServerFQDN/RootDSE"
+        $rootDSE = if ($Credential) {
+            New-Object System.DirectoryServices.DirectoryEntry($rootDSEPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        } else { [ADSI]$rootDSEPath }
+        if ($rootDSE.Properties['isSynchronized'][0] -ne $true) {
+            Write-IdentIRLog -Message "Authenticating DC '$logonServerFQDN' is not synchronized." -TypeName 'Error' -ForegroundColor Red
+            return $false
+        }
+        $domainDN = $rootDSE.Properties['defaultNamingContext'][0]
+        if (-not $domainDN) {
+            Write-IdentIRLog -Message "defaultNamingContext missing on '$logonServerFQDN'." -TypeName 'Error' -ForegroundColor Red
+            return $false
+        }
+        $domainName = ($domainDN -replace 'DC=','' -replace ',', '.')
+        Write-IdentIRLog -Message "Identified session: User='$currentUsername', Domain='$domainName', DC='$logonServerFQDN' (WhatIf=$WhatIfPreference)" -TypeName 'Info' -ForegroundColor Cyan
+        # Locate current user
+        $searchRootPath = "LDAP://$logonServerFQDN/$domainDN"
+        $searchRoot = if ($Credential) {
+            New-Object System.DirectoryServices.DirectoryEntry($searchRootPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        } else { [ADSI]$searchRootPath }
+        $ds = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
+        $ds.Filter = "(&(objectClass=user)(sAMAccountName=$currentUsername))"
+        $ds.PageSize = 1
+        $ds.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+        $res = $ds.FindOne()
+        if (-not $res) {
+            Write-IdentIRLog -Message "User '$currentUsername' not found in '$domainName'." -TypeName 'Error' -ForegroundColor Red
+            return $false
+        }
+        $userDN = $res.Properties['distinguishedName'][0]
+        $userPath = "LDAP://$logonServerFQDN/$userDN"
+        $userDE = if ($Credential) {
+            New-Object System.DirectoryServices.DirectoryEntry($userPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        } else { [ADSI]$userPath }
+        $confirmTarget = "$userDN on $logonServerFQDN"
+        # WhatIf: emit native line but don't treat as cancel
+        if ($WhatIfPreference) {
+            $null = $PSCmdlet.ShouldProcess($confirmTarget, "Reset password for current user")
+            Write-IdentIRLog -Message "[WhatIf] Would reset password for '$currentUsername' in '$domainName'." -TypeName 'Info' -ForegroundColor Green
+            return $true
+        }
+        if (-not $PSCmdlet.ShouldProcess($confirmTarget, "Reset password for current user")) {
+            Write-IdentIRLog -Message "Operation cancelled." -TypeName 'Warning' -ForegroundColor Yellow
+            return $false
+        }
+        $newSecure = $null
+        if ($Password) {
+            $newSecure = $Password
+        } else {
+            while ($true) {
+                $p1 = Read-Host "Enter a new password for '$currentUsername'" -AsSecureString
+                $p2 = Read-Host "Re-enter the new password for '$currentUsername'" -AsSecureString
+                $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1)
+                $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2)
+                $s1 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b1)
+                $s2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b2)
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1)
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2)
+                if ($s1 -ne $s2) { Write-Warning "Passwords do not match. Try again."; continue }
+                $newSecure = $p1
+                # Clear plaintext copies
+                $s1 = $null; $s2 = $null
+                break
+            }
+        }
+        # Convert to plaintext ONLY for the call, then zero it
+        $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($newSecure)
+        $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b)
+        $ok = $false
+        for ($i=1; $i -le 2; $i++) {
+            try {
+                # IMPORTANT: Invoke SetPassword with a *string* argument
+                $userDE.psbase.Invoke('SetPassword', @($plain))
+                # Optional but harmless:
+                $userDE.CommitChanges()
+                $ok = $true
+                break
+            } catch {
+                if ($i -eq 2) {
+                    Write-IdentIRLog -Message "Password reset failed for '$currentUsername' on '$logonServerFQDN': $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
+                    return $false
+                }
+                Start-Sleep -Milliseconds 400
+            }
+        }
+        if ($b) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
+        $plain = $null
+        # Purge Kerberos tickets (best-effort)
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = 'klist'
+            $psi.Arguments = 'purge'
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.CreateNoWindow = $true
+            $p = [System.Diagnostics.Process]::Start($psi); $p.WaitForExit(); $p.Dispose()
+            Write-IdentIRLog -Message 'Kerberos tickets purged.' -TypeName 'Info' -ForegroundColor Gray
+        } catch {
+            Write-IdentIRLog -Message 'Kerberos ticket purge encountered a non-critical error.' -TypeName 'Warning' -ForegroundColor Yellow
+        }
+        Write-IdentIRLog -Message "Password reset completed for '$currentUsername' in '$domainName'." -TypeName 'Info' -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-IdentIRLog -Message "Set-CurrentPassword error: $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
+        return $false
+    }
+    finally {
+        $script:ConfirmPreference = $oldConfirm
+        $WhatIfPreference = $oldWhatIf
+    }
+}
