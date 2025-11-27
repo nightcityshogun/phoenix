@@ -297,6 +297,52 @@ function Invoke-WinUI {
         return $result
     }
 
+    function Get-CurrentUserPwdLastSet {
+        try {
+            $user = $env:USERNAME
+            if (-not $user) { return $null }
+
+            $logonServerNetBIOS = $env:LOGONSERVER -replace '^\\\\',''
+            if (-not $logonServerNetBIOS) { return $null }
+
+            try { $dcFqdn = [System.Net.Dns]::GetHostEntry($logonServerNetBIOS).HostName }
+            catch { $dcFqdn = $logonServerNetBIOS }
+
+            $rootDsePath = "LDAP://$dcFqdn/RootDSE"
+            $rootDse = [ADSI]$rootDsePath
+            $domainDN = $rootDse.Properties['defaultNamingContext'][0]
+            if (-not $domainDN) { return $null }
+
+            $searchRoot = [ADSI]"LDAP://$dcFqdn/$domainDN"
+            $ds = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
+            $ds.Filter = "(&(objectClass=user)(sAMAccountName=$user))"
+            $ds.PageSize = 1
+            $ds.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+            $ds.PropertiesToLoad.Add('pwdLastSet') | Out-Null
+
+            $res = $ds.FindOne()
+            if (-not $res -or -not $res.Properties['pwdlastset']) { return $null }
+
+            $val = $res.Properties['pwdlastset'][0]
+
+            # Handle IADsLargeInteger vs Int64
+            if ($val -is [System.__ComObject]) {
+                $hi = $val.HighPart
+                $lo = $val.LowPart
+                $fileTime = ([int64]$hi -shl 32) -bor ($lo -band 0xFFFFFFFFL)
+            } else {
+                $fileTime = [int64]$val
+            }
+
+            if ($fileTime -le 0) { return $null }
+
+            return [datetime]::FromFileTime($fileTime)
+        } catch {
+            Write-IdentIRLog -Message "Get-CurrentUserPwdLastSet failed: $($_.Exception.Message)" -TypeName 'Warning' -ForegroundColor Yellow
+            return $null
+        }
+    }
+
     # Enumerate OUs and containers for a given domain using discovered DCs (flat list)
     function Get-DomainOUsForDomain {
         param(
@@ -1006,34 +1052,56 @@ function Invoke-WinUI {
             $script:taskProgressBar.Visibility = 'Visible'
             $script:statusText.Text = 'Starting tasks...'
 
-            # Always run Set-CurrentPassword (with dialog)
+            # ------------------------------------------------------------------
+            # Current user password reset: ONLY prompt if pwdLastSet >= 24 hours
+            # ------------------------------------------------------------------
             $currentStep++
             $script:taskProgressBar.Value = $currentStep
-            $script:statusText.Text += "`nPrompting for Current User Password Reset ($([math]::Round(($currentStep/$totalSteps)*100))%)"
+            $percent = [math]::Round(($currentStep / $totalSteps) * 100, 0)
 
-            $pwdResult = Show-PasswordDialog
-            if ($pwdResult.Success) {
-                try {
-                    $success = Set-CurrentPassword -Password $pwdResult.Password -Execute:$script:whatIfToggle.IsChecked
-                    if ($success) {
-                        $message = "Current User Password Reset completed"
-                        Write-IdentIRLog -Message $message -TypeName 'Info'
-                        Write-Host $message -ForegroundColor Green
-                        $script:statusText.Text += "`nCurrent User Password Reset: Success"
-                    } else {
-                        $message = "Current User Password Reset failed"
+            $pwdLastSet = Get-CurrentUserPwdLastSet
+            $needPrompt = $true
+
+            if ($pwdLastSet) {
+                $ageHours = ((Get-Date) - $pwdLastSet).TotalHours
+                Write-IdentIRLog -Message ("Current user pwdLastSet={0} (age={1:N1}h)" -f $pwdLastSet, $ageHours) -TypeName 'Info'
+
+                if ($ageHours -lt 24) {
+                    # Password changed less than 24h ago -> skip dialog
+                    $needPrompt = $false
+                    $script:statusText.Text += "`nCurrent User Password Reset: Skipped (pwdLastSet < 24h)"
+                }
+            } else {
+                Write-IdentIRLog -Message "Unable to retrieve pwdLastSet for current user; defaulting to prompting for password reset." -TypeName 'Warning' -ForegroundColor Yellow
+            }
+
+            if ($needPrompt) {
+                $script:statusText.Text += "`nPrompting for Current User Password Reset ($percent%)"
+
+                $pwdResult = Show-PasswordDialog
+                if ($pwdResult.Success) {
+                    try {
+                        $success = Set-CurrentPassword -Password $pwdResult.Password -Execute:$script:whatIfToggle.IsChecked
+                        if ($success) {
+                            $message = "Current User Password Reset completed"
+                            Write-IdentIRLog -Message $message -TypeName 'Info'
+                            Write-Host $message -ForegroundColor Green
+                            $script:statusText.Text += "`nCurrent User Password Reset: Success"
+                        } else {
+                            $message = "Current User Password Reset failed"
+                            Write-IdentIRLog -Message $message -TypeName 'Error'
+                            Write-Host $message -ForegroundColor Red
+                            $script:statusText.Text += "`n$message"
+                        }
+                    } catch {
+                        $message = "Current User Password Reset failed: $($_.Exception.Message)"
                         Write-IdentIRLog -Message $message -TypeName 'Error'
                         Write-Host $message -ForegroundColor Red
                         $script:statusText.Text += "`n$message"
                     }
-                } catch {
-                    $message = "Current User Password Reset failed: $($_.Exception.Message)"
-                    Write-IdentIRLog -Message $message -TypeName 'Error'
-                    Write-Host $message -ForegroundColor Red
-                    $script:statusText.Text += "`n$message"
+                } else {
+                    $script:statusText.Text += "`nCurrent User Password Reset: Skipped (canceled)"
                 }
-            } else {
-                $script:statusText.Text += "`nCurrent User Password Reset: Skipped (canceled)"
             }
 
             # Other tasks
