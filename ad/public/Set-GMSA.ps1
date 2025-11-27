@@ -282,7 +282,7 @@ function Set-GMSA {
             return
         }
 
-        # Single forest check â€“ derive forest root NC from available online DCs
+        # Single forest check – derive forest root NC from available online DCs
         $forestRoots = New-Object System.Collections.Generic.HashSet[string]
         foreach ($dc in $validated | Where-Object { $_.Online }) {
             try {
@@ -731,30 +731,6 @@ function Set-GMSA {
                     } catch {
                         Write-IdentIRLog -Message "Host rebind query failed in ${domainDn}: $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
                     }
-                }
-            }
-
-            # Verify new KDS usage (execution only). GUID starts at offset 24.
-            if (-not $whatIf -and $gmsaIndex.Count -gt 0 -and $firstNewDn -and $newKdsCn) {
-                try {
-                    Start-Sleep -Seconds 2
-                    $nde = & $script:GetDe ("LDAP://${bindServer}/${firstNewDn}")
-                    $bytes = $nde.Properties['msDS-ManagedPasswordId'].Value
-                    if ($bytes -and $bytes.Length -ge 40) {
-                        [byte[]]$guidBytes = $bytes[24..39]
-                        $extractedGuid = New-Object Guid -ArgumentList (,$guidBytes)
-                        $extractedStr  = $extractedGuid.ToString()
-
-                        if ($extractedStr -eq $newKdsCn) {
-                            Write-IdentIRLog -Message "Verified gMSA $firstNewDn uses new KDS key $newKdsCn." -TypeName 'Info' -ForegroundColor Green
-                        } else {
-                            Write-IdentIRLog -Message "KDS verification mismatch for $firstNewDn (GUID $extractedStr vs new key $newKdsCn)." -TypeName 'Error' -ForegroundColor Red
-                        }
-                    } else {
-                        Write-IdentIRLog -Message "msDS-ManagedPasswordId missing or too short for verification on $firstNewDn." -TypeName 'Warning' -ForegroundColor Yellow
-                    }
-                } catch {
-                    Write-IdentIRLog -Message "KDS verification failed in ${domain}: $($_.Exception.Message)" -TypeName 'Warning' -ForegroundColor Yellow
                 }
             }
 
