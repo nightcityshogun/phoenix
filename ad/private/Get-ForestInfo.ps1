@@ -1,17 +1,87 @@
 function Get-ForestInfo {
     <#
     .SYNOPSIS
-    Enumerates all domain controllers in the current forest and returns a normalized inventory.
+    Discovers and inventories Active Directory domain controllers across the current forest.
 
     .DESCRIPTION
-    Uses ADSI / System.DirectoryServices to query the forest Configuration NC (CN=Sites,...)
-    for NTDS Settings objects (DCs). For each DC, resolves server objects, maps to domain and
-    site, converts objectGUID to DnsGuid, gathers GC/RODC/PDC/IPv4 info, and tests LDAP 389.
+    Get-ForestInfo enumerates NTDS Settings objects under the forest Configuration
+    naming context (CN=Sites,...) to identify all domain controllers, then:
 
-    Per-DC work is parallelized via a runspace pool. If -MaxConcurrent is not specified,
-    a dynamic value is chosen based on DC count and processor count, capped at 32.
+    * Resolves associated server and computer objects.
+    * Derives domain names, domain SIDs, and default naming contexts.
+    * Determines GC, RODC, and PDC status.
+    * Resolves IPv4 addresses and AD site membership.
+    * Tests LDAP 389 connectivity to mark DCs as Online/Offline.
+    * Classifies each DC as Forest Root, Child Domain, or Tree Root.
 
-    Logging uses Write-IdentIRLog and honours -WinStyleHidden for noise reduction.
+    Per-DC work is parallelized through a runspace pool. When -MaxConcurrent is not
+    specified, a dynamic value is chosen based on the number of DCs and processor
+    count, capped at 32.
+
+    Logging is performed via Write-IdentIRLog. When -WinStyleHidden is specified,
+    console output is suppressed, but logging still occurs.
+
+    .PARAMETER Credential
+    Specifies alternate credentials to use for all LDAP and configuration queries.
+    Useful for isolated or recovery environments where the current logon context
+    does not have forest-wide visibility.
+
+    When omitted, the current logon context is used. This function does not prompt
+    interactively for credentials; callers are responsible for providing them.
+
+    .PARAMETER WinStyleHidden
+    Suppresses console output for quieter operation (e.g., when called from a GUI
+    or hidden console window). Logging via Write-IdentIRLog continues as normal.
+
+    .PARAMETER MaxConcurrent
+    Sets the maximum number of parallel runspaces used to process DC inventory
+    work items. If omitted, a dynamic value is calculated based on processor count
+    and the number of discovered DCs, with a hard cap of 32.
+
+    .EXAMPLE
+    # Discover DCs in the current forest using the current logon context
+    $dcs = Get-ForestInfo
+
+    .EXAMPLE
+    # Discover DCs in a recovery environment using explicit credentials
+    $cred = Get-Credential
+    $dcs  = Get-ForestInfo -Credential $cred -WinStyleHidden
+
+    .EXAMPLE
+    # Discover DCs with constrained parallelism
+    $dcs = Get-ForestInfo -MaxConcurrent 8
+
+    .OUTPUTS
+    PSCustomObject
+
+    Returns one object per domain controller with (at minimum) the following
+    properties:
+
+    * Type                       (Forest Root | Child Domain | Tree Root | Unknown)
+    * Domain                     (FQDN)
+    * DomainSid                  (string SID)
+    * Site                       (AD site name)
+    * SamAccountName             (DC computer account sAMAccountName)
+    * NetBIOS                    (NetBIOS name)
+    * FQDN                       (DNS host name)
+    * IsGC                       (bool)
+    * IsRODC                     (bool)
+    * IPv4Address                (string, one or more IPv4 addresses)
+    * Online                     (bool, based on LDAP 389 test)
+    * DistinguishedName          (DC computer DN)
+    * ServerReferenceBL          (NTDS Settings DN)
+    * IsPdcRoleOwner             (bool)
+    * DefaultNamingContext       (domain DN)
+    * ConfigurationNamingContext (forest configuration DN)
+    * DnsGuid                    (string GUID / DnsHostName GUID)
+    * ForestRootFQDN             (forest root domain FQDN)
+
+    .NOTES
+    Author:  NightCityShogun
+    Version: 1.9
+    Requires: PowerShell 5.1+, System.DirectoryServices, System.DirectoryServices.ActiveDirectory
+    Privileges: Domain / Enterprise admin privileges recommended for full visibility.
+    Â© 2025 NightCityShogun. All rights reserved.
     #>
     [CmdletBinding()]
     param(
@@ -21,10 +91,8 @@ function Get-ForestInfo {
     )
 
     begin {
-        # Strongly-typed list
         $domainList = New-Object 'System.Collections.Generic.List[PSObject]'
 
-        # Assemblies (PS5 / .NET 4.x)
         [void][System.Reflection.Assembly]::LoadWithPartialName('System.DirectoryServices')
         [void][System.Reflection.Assembly]::LoadWithPartialName('System.DirectoryServices.ActiveDirectory')
         [void][System.Reflection.Assembly]::LoadWithPartialName('System.Core')
@@ -36,76 +104,97 @@ function Get-ForestInfo {
     process {
         try {
             if (-not $WinStyleHidden) {
-                Write-IdentIRLog -Message "Get-ForestInfo: Starting forest discovery via ADSI with runspace pool." -TypeName 'Info' -ForegroundColor White
+                Write-IdentIRLog -Message "Starting forest discovery." -TypeName "Info" -ForegroundColor White
             }
 
-            # -------- Forest + RootDSE --------
+            $forest           = $null
+            $rootDSE          = $null
+            $forestRootDomain = $null
+
+            # Try to resolve forest via current context (non-fatal if it fails)
             try {
                 $forest = [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
             } catch {
-                Write-IdentIRLog -Message "Get-ForestInfo: Failed to get current forest: $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
-                return
+                if (-not $WinStyleHidden) {
+                    Write-IdentIRLog -Message "Get-ForestInfo: GetCurrentForest() failed, continuing with RootDSE only: $($_.Exception.Message)" -TypeName "Warning" -ForegroundColor Yellow
+                }
             }
 
-            $forestRootDomain = $forest.RootDomain.Name.ToLower()
-
-            $rootDsePath = 'LDAP://RootDSE'
-            $rootDSE = if ($Credential) {
-                New-Object System.DirectoryServices.DirectoryEntry(
+            $rootDsePath = "LDAP://RootDSE"
+            if ($Credential) {
+                $rootDSE = New-Object System.DirectoryServices.DirectoryEntry(
                     $rootDsePath,
                     $Credential.UserName,
                     $Credential.GetNetworkCredential().Password
                 )
             } else {
-                [ADSI]$rootDsePath
+                $rootDSE = [ADSI]$rootDsePath
             }
 
             if (-not $rootDSE) {
-                Write-IdentIRLog -Message "Get-ForestInfo: Unable to bind to LDAP://RootDSE. Ensure a DC is reachable." -TypeName 'Error' -ForegroundColor Red
+                Write-IdentIRLog -Message "Get-ForestInfo: Unable to bind to LDAP://RootDSE. Ensure a DC is reachable." -TypeName "Error" -ForegroundColor Red
                 return
             }
 
             try {
                 $rootDSE.RefreshCache()
             } catch {
-                Write-IdentIRLog -Message "Get-ForestInfo: RootDSE.RefreshCache() failed: $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
+                Write-IdentIRLog -Message "Get-ForestInfo: RootDSE.RefreshCache() failed: $($_.Exception.Message)" -TypeName "Error" -ForegroundColor Red
                 return
+            }
+
+            # Forest root domain: prefer Forest object, fall back to RootDSE
+            if ($forest) {
+                $forestRootDomain = $forest.RootDomain.Name.ToLower()
+            } else {
+                try {
+                    $rootDomainNC = $rootDSE.Properties['rootDomainNamingContext'][0].ToString()
+                    $forestRootDomain = (
+                        $rootDomainNC -split ',' |
+                        Where-Object { $_ -like 'DC=*' } |
+                        ForEach-Object { $_ -replace '^DC=' }
+                    ) -join '.'
+                    $forestRootDomain = $forestRootDomain.ToLower()
+                } catch {
+                    Write-IdentIRLog -Message "Get-ForestInfo: Unable to derive forest root domain: $($_.Exception.Message)" -TypeName "Error" -ForegroundColor Red
+                    return
+                }
             }
 
             $configNC = $rootDSE.Properties['configurationNamingContext'][0].ToString()
 
             # -------- Query NTDS Settings (DCs) --------
             $searcher = New-Object System.DirectoryServices.DirectorySearcher
-            $searcher.SearchRoot = if ($Credential) {
-                New-Object System.DirectoryServices.DirectoryEntry(
+            if ($Credential) {
+                $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry(
                     "LDAP://CN=Sites,$configNC",
                     $Credential.UserName,
                     $Credential.GetNetworkCredential().Password
                 )
             } else {
-                [ADSI]"LDAP://CN=Sites,$configNC"
+                $searcher.SearchRoot = [ADSI]"LDAP://CN=Sites,$configNC"
             }
 
             if (-not $searcher.SearchRoot) {
-                Write-IdentIRLog -Message "Get-ForestInfo: Unable to bind to LDAP://CN=Sites,$configNC." -TypeName 'Error' -ForegroundColor Red
+                Write-IdentIRLog -Message "Get-ForestInfo: Unable to bind to LDAP://CN=Sites,$configNC." -TypeName "Error" -ForegroundColor Red
                 return
             }
 
-            $searcher.Filter   = '(objectClass=nTDSDSA)'
+            $searcher.Filter   = "(objectClass=nTDSDSA)"
             $searcher.PageSize = 1000
-            [void]$searcher.PropertiesToLoad.Add('distinguishedName')
-            [void]$searcher.PropertiesToLoad.Add('serverReference')
-            [void]$searcher.PropertiesToLoad.Add('objectGUID')
+            [void]$searcher.PropertiesToLoad.Add("distinguishedName")
+            [void]$searcher.PropertiesToLoad.Add("serverReference")
+            [void]$searcher.PropertiesToLoad.Add("objectGUID")
 
             try {
                 $ntdsObjects = $searcher.FindAll()
             } catch {
-                Write-IdentIRLog -Message "Get-ForestInfo: NTDS search failed: $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
+                Write-IdentIRLog -Message "Get-ForestInfo: NTDS search failed: $($_.Exception.Message)" -TypeName "Error" -ForegroundColor Red
                 return
             }
 
             if (-not $ntdsObjects -or $ntdsObjects.Count -eq 0) {
-                Write-IdentIRLog -Message "Get-ForestInfo: No NTDS Settings objects found in CN=Sites,$configNC." -TypeName 'Error' -ForegroundColor Red
+                Write-IdentIRLog -Message "Get-ForestInfo: No NTDS Settings objects found in CN=Sites,$configNC." -TypeName "Error" -ForegroundColor Red
                 return
             }
 
@@ -123,7 +212,7 @@ function Get-ForestInfo {
                 $serverDN = if ($ntds.Properties['serverReference'] -and $ntds.Properties['serverReference'][0]) {
                     $ntds.Properties['serverReference'][0].ToString()
                 } else {
-                    if ($ntdsDN -like 'CN=NTDS Settings,*') {
+                    if ($ntdsDN -like "CN=NTDS Settings,*") {
                         ($ntdsDN -split ',', 2)[1]
                     } else {
                         $null
@@ -133,14 +222,14 @@ function Get-ForestInfo {
                 if (-not $serverDN) { continue }
 
                 # Server object in Configuration NC
-                $serverEntry = if ($Credential) {
-                    New-Object System.DirectoryServices.DirectoryEntry(
+                if ($Credential) {
+                    $serverEntry = New-Object System.DirectoryServices.DirectoryEntry(
                         "LDAP://$serverDN",
                         $Credential.UserName,
                         $Credential.GetNetworkCredential().Password
                     )
                 } else {
-                    [ADSI]"LDAP://$serverDN"
+                    $serverEntry = [ADSI]"LDAP://$serverDN"
                 }
 
                 if (-not $serverEntry -or -not $serverEntry.dNSHostName) { continue }
@@ -156,7 +245,7 @@ function Get-ForestInfo {
                         $dnsGuid   = (New-Object System.Guid -ArgumentList (, $guidBytes)).ToString()
                     } catch {
                         if (-not $WinStyleHidden) {
-                            Write-IdentIRLog -Message "Get-ForestInfo: Failed to convert objectGUID for ${ntdsDN}: $($_.Exception.Message)" -TypeName 'Warning' -ForegroundColor Yellow
+                            Write-IdentIRLog -Message "Get-ForestInfo: Failed to convert objectGUID for ${ntdsDN}: $($_.Exception.Message)" -TypeName "Warning" -ForegroundColor Yellow
                         }
                     }
                 }
@@ -172,18 +261,17 @@ function Get-ForestInfo {
             }
 
             if ($workItems.Count -eq 0) {
-                Write-IdentIRLog -Message "Get-ForestInfo: No valid NTDS/Server pairs discovered in the forest." -TypeName 'Error' -ForegroundColor Red
+                Write-IdentIRLog -Message "Get-ForestInfo: No valid NTDS/Server pairs discovered in the forest." -TypeName "Error" -ForegroundColor Red
                 return
             }
 
             # -------- Dynamic concurrency if not specified --------
-            if (-not $PSBoundParameters.ContainsKey('MaxConcurrent') -or $MaxConcurrent -lt 1) {
+            if (-not $PSBoundParameters.ContainsKey("MaxConcurrent") -or $MaxConcurrent -lt 1) {
                 $workCount = $workItems.Count
                 $cores     = [Environment]::ProcessorCount
                 $base      = [Math]::Ceiling($cores * 1.5)
                 $hardCap   = 32
 
-                # FIX: Min only has 2-arg overloads – nest it
                 $calc = [Math]::Min([Math]::Min($base, $hardCap), $workCount)
 
                 if ($calc -lt 4 -and $workCount -ge 4) { $calc = 4 }
@@ -193,7 +281,8 @@ function Get-ForestInfo {
             }
 
             if (-not $WinStyleHidden) {
-                Write-IdentIRLog -Message "Get-ForestInfo: Discovered $($workItems.Count) NTDS objects. Using MaxConcurrent=$MaxConcurrent (Cores=$([Environment]::ProcessorCount))." -TypeName 'Info' -ForegroundColor White
+                $msg = "Get-ForestInfo: Discovered {0} NTDS objects. Using MaxConcurrent={1} (Cores={2})." -f $workItems.Count, $MaxConcurrent, [Environment]::ProcessorCount
+                Write-IdentIRLog -Message $msg -TypeName "Info" -ForegroundColor White
             }
 
             # -------- Runspace pool setup --------
@@ -225,12 +314,12 @@ function Get-ForestInfo {
                         return $null
                     }
 
-                    # ---------- 1) Online test (LDAP 389) ----------
+                    # ---------- 1) Online test (LDAP 389, 500ms) ----------
                     $online = $false
                     try {
                         $tcp = New-Object System.Net.Sockets.TcpClient
                         $ar  = $tcp.BeginConnect($fqdn, 389, $null, $null)
-                        if ($ar.AsyncWaitHandle.WaitOne(500, $false)) {
+                        if ($ar.AsyncWaitHandle.WaitOne(500, $false) -and $tcp.Connected) {
                             $tcp.EndConnect($ar)
                             $online = $true
                         }
@@ -240,14 +329,14 @@ function Get-ForestInfo {
                     }
 
                     # ---------- 2) Server entry (Configuration NC) ----------
-                    $serverEntry = if ($Cred) {
-                        New-Object System.DirectoryServices.DirectoryEntry(
+                    if ($Cred) {
+                        $serverEntry = New-Object System.DirectoryServices.DirectoryEntry(
                             "LDAP://$serverDN",
                             $Cred.UserName,
                             $Cred.GetNetworkCredential().Password
                         )
                     } else {
-                        [ADSI]"LDAP://$serverDN"
+                        $serverEntry = [ADSI]"LDAP://$serverDN"
                     }
 
                     # Site from serverDN (CN=Server,CN=<Site>,CN=Servers,...)
@@ -261,7 +350,7 @@ function Get-ForestInfo {
 
                     # ---------- 3) Domain DN + name ----------
                     $domainDN   = $null
-                    $domainName = 'Unknown'
+                    $domainName = "Unknown"
                     try {
                         if ($serverEntry -and $serverEntry.serverReference) {
                             $srvRef = $serverEntry.serverReference
@@ -281,14 +370,21 @@ function Get-ForestInfo {
                     # ---------- 4) Domain entry (SID + FSMO) ----------
                     $domainEntry = $null
                     if ($domainDN) {
-                        $domainEntry = if ($Cred) {
-                            New-Object System.DirectoryServices.DirectoryEntry(
-                                "LDAP://$domainDN",
+                        # Pin to this DC's FQDN so we do not depend on DC Locator
+                        if ($fqdn) {
+                            $ldapPath = "LDAP://$fqdn/$domainDN"
+                        } else {
+                            $ldapPath = "LDAP://$domainDN"
+                        }
+
+                        if ($Cred) {
+                            $domainEntry = New-Object System.DirectoryServices.DirectoryEntry(
+                                $ldapPath,
                                 $Cred.UserName,
                                 $Cred.GetNetworkCredential().Password
                             )
                         } else {
-                            [ADSI]"LDAP://$domainDN"
+                            $domainEntry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
                         }
                     }
 
@@ -321,23 +417,33 @@ function Get-ForestInfo {
 
                     if ($domainDN) {
                         $compSearcher = New-Object System.DirectoryServices.DirectorySearcher
-                        $compSearcher.SearchRoot = if ($Cred) {
-                            New-Object System.DirectoryServices.DirectoryEntry(
-                                "LDAP://$domainDN",
+
+                        # Pin search root to this DC
+                        if ($fqdn) {
+                            $searchRootPath = "LDAP://$fqdn/$domainDN"
+                        } else {
+                            $searchRootPath = "LDAP://$domainDN"
+                        }
+
+                        if ($Cred) {
+                            $searchRoot = New-Object System.DirectoryServices.DirectoryEntry(
+                                $searchRootPath,
                                 $Cred.UserName,
                                 $Cred.GetNetworkCredential().Password
                             )
                         } else {
-                            [ADSI]"LDAP://$domainDN"
+                            $searchRoot = New-Object System.DirectoryServices.DirectoryEntry($searchRootPath)
                         }
+
+                        $compSearcher.SearchRoot = $searchRoot
                         $compSearcher.Filter = "(&(objectCategory=computer)(dNSHostName=$fqdn))"
                         $compSearcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
                         $compSearcher.PageSize = 1
-                        [void]$compSearcher.PropertiesToLoad.Add('name')
-                        [void]$compSearcher.PropertiesToLoad.Add('sAMAccountName')
-                        [void]$compSearcher.PropertiesToLoad.Add('distinguishedName')
-                        [void]$compSearcher.PropertiesToLoad.Add('msDS-isGC')
-                        [void]$compSearcher.PropertiesToLoad.Add('msDS-isRODC')
+                        [void]$compSearcher.PropertiesToLoad.Add("name")
+                        [void]$compSearcher.PropertiesToLoad.Add("sAMAccountName")
+                        [void]$compSearcher.PropertiesToLoad.Add("distinguishedName")
+                        [void]$compSearcher.PropertiesToLoad.Add("msDS-isGC")
+                        [void]$compSearcher.PropertiesToLoad.Add("msDS-isRODC")
 
                         try {
                             $computer = $compSearcher.FindOne()
@@ -365,26 +471,26 @@ function Get-ForestInfo {
                     }
 
                     # ---------- 6) IPv4 resolution ----------
-                    $ipv4 = 'Unknown'
+                    $ipv4 = "Unknown"
                     try {
                         $addrs = [System.Net.Dns]::GetHostAddresses($fqdn) |
                                  Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
                                  ForEach-Object { $_.IPAddressToString }
                         if ($addrs -and $addrs.Count -gt 0) {
-                            $ipv4 = ($addrs -join ', ')
+                            $ipv4 = ($addrs -join ", ")
                         }
                     } catch { }
 
                     # ---------- 7) Type classification ----------
-                    $type = 'Unknown'
-                    if ($domainName -ne 'Unknown') {
+                    $type = "Unknown"
+                    if ($domainName -ne "Unknown") {
                         $lowerDomain = $domainName.ToLower()
                         if ($lowerDomain -eq $forestRootFQDN) {
-                            $type = 'Forest Root'
+                            $type = "Forest Root"
                         } elseif ($lowerDomain.EndsWith(".$forestRootFQDN")) {
-                            $type = 'Child Domain'
+                            $type = "Child Domain"
                         } else {
-                            $type = 'Tree Root'
+                            $type = "Tree Root"
                         }
                     }
 
@@ -409,8 +515,8 @@ function Get-ForestInfo {
                         ForestRootFQDN             = $forestRootFQDN
                     }
 
-                }).AddParameter('WorkItem', $item).
-                  AddParameter('Cred', $Credential)
+                }).AddParameter("WorkItem", $item).
+                  AddParameter("Cred", $Credential)
 
                 $handle = $ps.BeginInvoke()
                 $jobs += [PSCustomObject]@{
@@ -430,7 +536,7 @@ function Get-ForestInfo {
                     }
                 } catch {
                     if (-not $WinStyleHidden) {
-                        Write-IdentIRLog -Message "Get-ForestInfo: Per-DC runspace failed: $($_.Exception.Message)" -TypeName 'Warning' -ForegroundColor Yellow
+                        Write-IdentIRLog -Message "Get-ForestInfo: Per-DC runspace failed: $($_.Exception.Message)" -TypeName "Warning" -ForegroundColor Yellow
                     }
                 } finally {
                     $job.PowerShell.Dispose()
@@ -441,11 +547,12 @@ function Get-ForestInfo {
             $runspacePool.Dispose()
 
             if (-not $WinStyleHidden) {
-                Write-IdentIRLog -Message "Get-ForestInfo: Completed. DC objects returned: $($domainList.Count)." -TypeName 'Info' -ForegroundColor Green
+                $msg = "Get-ForestInfo: Completed. DC objects returned: {0}." -f $domainList.Count
+                Write-IdentIRLog -Message $msg -TypeName "Info" -ForegroundColor Green
             }
         }
         catch {
-            Write-IdentIRLog -Message "Get-ForestInfo: Fatal error: $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
+            Write-IdentIRLog -Message "Get-ForestInfo: Fatal error: $($_.Exception.Message)" -TypeName "Error" -ForegroundColor Red
         }
         finally {
             if ($ntdsObjects) { $ntdsObjects.Dispose() }
