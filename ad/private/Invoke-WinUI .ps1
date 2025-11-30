@@ -297,6 +297,138 @@ function Invoke-WinUI {
         return $result
     }
 
+    function Show-AdCredentialDialog {
+        $dialog = New-Object System.Windows.Window
+        $dialog.Title = "Active Directory Credentials"
+        $dialog.Width = 420
+        $dialog.Height = 230
+        $dialog.WindowStartupLocation = 'CenterOwner'
+        $dialog.Owner = $form
+        $dialog.ResizeMode = 'NoResize'
+        $dialog.WindowStyle = 'SingleBorderWindow'
+
+        $grid = New-Object System.Windows.Controls.Grid
+        $grid.Margin = 20
+
+        0..4 | ForEach-Object {
+            $row = New-Object System.Windows.Controls.RowDefinition
+            $row.Height = 'Auto'
+            $grid.RowDefinitions.Add($row) | Out-Null
+        }
+
+        $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition)) | Out-Null
+        $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition)) | Out-Null
+
+        # Note
+        $lblNote = New-Object System.Windows.Controls.TextBlock -Property @{
+            Text         = "Enter Enterprise Admin credentials for forest recovery."
+            TextWrapping = 'Wrap'
+            Margin       = '0,0,0,10'
+        }
+        [System.Windows.Controls.Grid]::SetRow($lblNote, 0)
+        [System.Windows.Controls.Grid]::SetColumnSpan($lblNote, 2)
+        $grid.Children.Add($lblNote) | Out-Null
+
+        # Username label
+        $lblUser = New-Object System.Windows.Controls.TextBlock -Property @{
+            Text   = 'User (domain\user or user@domain):'
+            Margin = '0,0,8,6'
+        }
+        [System.Windows.Controls.Grid]::SetRow($lblUser, 1)
+        $grid.Children.Add($lblUser) | Out-Null
+
+        # Username textbox
+        $txtUser = New-Object System.Windows.Controls.TextBox
+        $txtUser.Margin = '0,0,0,6'
+        [System.Windows.Controls.Grid]::SetRow($txtUser, 1)
+        [System.Windows.Controls.Grid]::SetColumn($txtUser, 1)
+        $grid.Children.Add($txtUser) | Out-Null
+
+        # Password label
+        $lblPwd = New-Object System.Windows.Controls.TextBlock -Property @{
+            Text   = 'Password:'
+            Margin = '0,0,8,6'
+        }
+        [System.Windows.Controls.Grid]::SetRow($lblPwd, 2)
+        $grid.Children.Add($lblPwd) | Out-Null
+
+        # Password box
+        $txtPwd = New-Object System.Windows.Controls.PasswordBox
+        [System.Windows.Controls.Grid]::SetRow($txtPwd, 2)
+        [System.Windows.Controls.Grid]::SetColumn($txtPwd, 1)
+        $grid.Children.Add($txtPwd) | Out-Null
+
+        # Buttons
+        $panel = New-Object System.Windows.Controls.StackPanel
+        $panel.Orientation = 'Horizontal'
+        $panel.HorizontalAlignment = 'Right'
+        $panel.Margin = '0,12,0,0'
+        [System.Windows.Controls.Grid]::SetRow($panel, 4)
+        [System.Windows.Controls.Grid]::SetColumnSpan($panel, 2)
+
+        $ok = New-Object System.Windows.Controls.Button -Property @{
+            Content = 'OK'
+            Width   = 80
+        }
+        $cancel = New-Object System.Windows.Controls.Button -Property @{
+            Content = 'Cancel'
+            Width   = 80
+            Margin  = '8,0,0,0'
+        }
+
+        $panel.Children.Add($ok)     | Out-Null
+        $panel.Children.Add($cancel) | Out-Null
+        $grid.Children.Add($panel)   | Out-Null
+
+        $dialog.Content = $grid
+
+        $result = $null
+
+        $ok.Add_Click({
+            $userText = $txtUser.Text.Trim()
+            if (-not $userText) {
+                [System.Windows.MessageBox]::Show(
+                    "Username is required.",
+                    "Error",
+                    'OK',
+                    'Error'
+                ) | Out-Null
+                return
+            }
+            if (-not $txtPwd.SecurePassword -or $txtPwd.SecurePassword.Length -le 0) {
+                [System.Windows.MessageBox]::Show(
+                    "Password is required.",
+                    "Error",
+                    'OK',
+                    'Error'
+                ) | Out-Null
+                return
+            }
+
+            try {
+                $cred = New-Object System.Management.Automation.PSCredential ($userText, $txtPwd.SecurePassword)
+                $result = $cred
+                $dialog.DialogResult = $true
+                $dialog.Close()
+            } catch {
+                [System.Windows.MessageBox]::Show(
+                    "Failed to create credentials: $($_.Exception.Message)",
+                    "Error",
+                    'OK',
+                    'Error'
+                ) | Out-Null
+            }
+        })
+
+        $cancel.Add_Click({
+            $dialog.DialogResult = $false
+            $dialog.Close()
+        })
+
+        $dialog.ShowDialog() | Out-Null
+        return $result
+    }
+
     function Get-CurrentUserPwdLastSet {
         try {
             $user = $env:USERNAME
@@ -813,7 +945,7 @@ function Invoke-WinUI {
         [System.Windows.Controls.Grid]::SetRow($bar, 0)
 
         $discoverBtn = New-Object Wpf.Ui.Controls.Button -Property @{
-            Content = 'Refresh Forest Discovery'
+            Content = 'Start Forest Discovery'
             Tag     = 'DiscoverButton'
         }
         $progress = New-Object System.Windows.Controls.ProgressBar -Property @{
@@ -860,7 +992,7 @@ function Invoke-WinUI {
         $content.Children.Add($list) | Out-Null
         $script:domainListView = $list
 
-        # Discovery click handler
+        # Discovery click handler with current-context-first, then credential dialog
         $discoverBtn.Add_Click({
             $this.IsEnabled = $false
             $this.Content   = "Discovering..."
@@ -872,11 +1004,54 @@ function Invoke-WinUI {
                     $params['WinStyleHidden'] = $true
                 }
 
-                $dcList = Get-ForestInfo @params
-                $dcList = @($dcList) # Force array
+                $dcList = $null
+
+                # Check if we appear to be logged on to a domain
+                $domainLoggedOn = $env:LOGONSERVER -and $env:USERDNSDOMAIN
+
+                if ($domainLoggedOn) {
+                    try {
+                        $msg = "Attempting forest discovery using current logon context ($env:USERDOMAIN\$env:USERNAME)."
+                        Write-IdentIRLog -Message $msg -TypeName 'Info'
+                        Write-Host $msg -ForegroundColor Cyan
+
+                        $dcList = Get-ForestInfo @params
+                        if ($dcList) {
+                            $dcList = @($dcList)
+                        }
+                    } catch {
+                        $msg = "Initial forest discovery with current logon context failed: $($_.Exception.Message)"
+                        Write-IdentIRLog -Message $msg -TypeName 'Warning'
+                        Write-Host $msg -ForegroundColor Yellow
+                        $dcList = $null
+                    }
+                }
+
+                # If nothing found or not domain-logged-on, prompt for Enterprise Admin credentials
+                if (-not $dcList -or $dcList.Count -eq 0) {
+                    $msg = "Forest discovery requires Enterprise Admin credentials. Prompting for credentials."
+                    Write-IdentIRLog -Message $msg -TypeName 'Info'
+                    Write-Host $msg -ForegroundColor Cyan
+
+                    $cred = Show-AdCredentialDialog
+                    if (-not $cred) {
+                        $cancelMsg = "Discovery canceled by user (no credentials provided)."
+                        Write-IdentIRLog -Message $cancelMsg -TypeName 'Warning'
+                        Write-Host $cancelMsg -ForegroundColor Yellow
+                        $script:domainListView.ItemsSource = @()
+                        $script:domainListView.Items.Refresh()
+                        throw $cancelMsg
+                    }
+
+                    $params['Credential'] = $cred
+                    $dcList = Get-ForestInfo @params
+                    if ($dcList) {
+                        $dcList = @($dcList)
+                    }
+                }
 
                 if (-not $dcList -or $dcList.Count -eq 0) {
-                    $message = "No domain controllers discovered."
+                    $message = "No domain controllers discovered. Ensure connectivity and Enterprise Admin permissions."
                     Write-IdentIRLog -Message $message -TypeName 'Error'
                     Write-Host $message -ForegroundColor Red
                     $script:domainListView.ItemsSource = @()
@@ -941,7 +1116,7 @@ function Invoke-WinUI {
                 [System.Windows.MessageBox]::Show("Error: $($_.Exception.Message)", "Discovery Error", 'OK', 'Error') | Out-Null
             } finally {
                 $this.IsEnabled = $true
-                $this.Content   = "Refresh Forest Discovery"
+                $this.Content   = "Start Forest Discovery"
                 $script:progressBar.Visibility = 'Collapsed'
             }
         })
@@ -1054,7 +1229,7 @@ function Invoke-WinUI {
             $allTasks = $script:taskToggles | Where-Object IsChecked | ForEach-Object Content
             $dcs      = @($script:domainListView.Items)
 
-            # NEW: Only online DCs are used for tasks
+            # Only online DCs are used for tasks
             $onlineDcs  = @($dcs | Where-Object { $_.Online })
             $offlineDcs = @($dcs | Where-Object { -not $_.Online })
 
@@ -1269,17 +1444,8 @@ function Invoke-WinUI {
 
     Update-RightPane 'Active Directory'
 
-    # Auto-discover forest on load
-    $form.Add_Loaded({
-        $contentPanel = $form.FindName("ContentPanel")
-        $discoverBtn = ($contentPanel.Children | Where-Object { $_ -is [System.Windows.Controls.StackPanel] })[0].Children |
-                       Where-Object { $_.Tag -eq 'DiscoverButton' }
-
-        if ($discoverBtn) {
-            $clickEvent = New-Object System.Windows.RoutedEventArgs -ArgumentList ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)
-            $discoverBtn.RaiseEvent($clickEvent)
-        }
-    })
+    # NOTE: Auto-discover forest on load intentionally removed.
+    # User must click "Start Forest Discovery" to Initiate Discovery of Domains and DCs in Isolation.
 
     [void]$form.ShowDialog()
     $form = $null
