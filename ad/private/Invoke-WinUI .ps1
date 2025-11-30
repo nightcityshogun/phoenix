@@ -1,3 +1,52 @@
+<#
+.SYNOPSIS
+Launches the Phoenix WPF user interface for orchestrating Active Directory forest
+recovery and post-compromise remediation workflows.
+
+.DESCRIPTION
+Invoke-WinUI hosts the Phoenix Fluent WPF console, providing a guided interface
+for:
+
+* Forest discovery and domain controller inventory (via Get-ForestInfo).
+* Task-driven Active Directory recovery operations (e.g. Sysvol restore, FSMO
+  seizure, DNS cleanup, DC / krbtgt / DSRM / built-in admin password resets,
+  GMSA rotation, and mass password reset orchestration).
+* Per-task execution mode control (WhatIf vs Execute) with progress tracking and
+  status output.
+* Per-domain scoping of actions using only online domain controllers from the
+  discovered inventory.
+
+The window uses Wpf.Ui’s FluentWindow, supports light/dark theme switching, and
+enforces a single active UI instance via the IDENTIR_UI_ACTIVE environment flag.
+All operational logging is performed through Write-IdentIRLog, with additional
+inline status updates in the UI.
+
+.PARAMETER WinStyleHidden
+Hides the hosting PowerShell console window when the UI is launched (SW_HIDE).
+Intended for use from shortcuts or launchers where only the WPF experience
+should be visible. Logging via Write-IdentIRLog continues as normal.
+
+.EXAMPLE
+# Launch the Phoenix recovery UI with the console visible
+Invoke-WinUI
+
+.EXAMPLE
+# Launch the Phoenix recovery UI in a console-hidden mode
+Invoke-WinUI -WinStyleHidden
+
+.OUTPUTS
+None
+
+Invoke-WinUI presents a graphical interface and does not emit pipeline output.
+Underlying recovery cmdlets may log or write their own progress as configured.
+
+.NOTES
+Author:  NightCityShogun
+Version: 1.9
+Requires: PowerShell 5.1+, .NET WPF, Wpf.Ui.dll
+© 2025 NightCityShogun. All rights reserved.
+#>
+
 function Invoke-WinUI {
     [CmdletBinding()]
     param (
