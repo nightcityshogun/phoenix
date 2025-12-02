@@ -1,4 +1,4 @@
-﻿<#
+<#
     .SYNOPSIS
     Discovers and inventories Active Directory domain controllers across the current forest.
 
