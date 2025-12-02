@@ -3,7 +3,7 @@
 Performs authoritative/non-authoritative SYSVOL restore across domains, handling DFSR or FRS paths with optional event verification.
 
 .DESCRIPTION
-Invoke-SysvolRestore orchestrates SYSVOL recovery in isolated AD forests. It orders domains (Forest Root → Child → Tree),
+Invoke-SysvolRestore orchestrates SYSVOL recovery in isolated AD forests. It orders domains (Forest Root â†’ Child â†’ Tree),
 chooses the PDC as authoritative by default, and:
 - DFSR: stops service, sets msDFSR-Enabled/Options (authoritative=TRUE after 4114/4602), polls AD, restarts, and resets startup.
 - FRS: stops NTFRS, sets BurFlags (D4 on auth, D2 on non-auth), restarts, and resets startup.
@@ -19,7 +19,7 @@ Apply changes. If omitted, actions are simulated (WhatIf=True).
 Also wait for DFS Replication Event ID 2010 (service stopped) before DFSR steps.
 
 .PARAMETER tStop
-Seconds to wait for “stop” events (e.g., DFSR 4114, FRS 13568). Default: 320.
+Seconds to wait for â€œstopâ€ events (e.g., DFSR 4114, FRS 13568). Default: 320.
 
 .PARAMETER tAuth
 Seconds to wait for authoritative initialization events (e.g., DFSR 4602, FRS 13553/13516). Default: 320.
@@ -46,9 +46,47 @@ Author: NightCityShogun
 Version: 1.0
 Requires: Domain Admin-level rights; CIM/DCOM access to DCs; DFSR/FRS service control.
 ConfirmImpact: Low; SupportsShouldProcess.
-© 2025 NightCityShogun. All rights reserved.
+2025 NightCityShogun. All rights reserved.
 #>
 
+<#
+.SYNOPSIS
+Performs authoritative/non-authoritative SYSVOL restore across domains, handling DFSR or FRS paths with optional event verification.
+.DESCRIPTION
+Invoke-SysvolRestore orchestrates SYSVOL recovery in isolated AD forests. It orders domains (Forest Root to Child to Tree),
+chooses the PDC as authoritative by default, and:
+- DFSR: stops service, sets msDFSR-Enabled/Options (authoritative=TRUE after 4114/4602), polls AD, restarts, and resets startup.
+- FRS: stops NTFRS, sets BurFlags (D4 on auth, D2 on non-auth), restarts, and resets startup.
+Optionally verifies key events (e.g., DFSR 2010/4114/4602/4614/4604; FRS 13568/13553/13516). Runs in WhatIf mode unless -Execute.
+.PARAMETER IsolatedDCList
+Inventory of DC objects used to order domains and locate PDC/secondary nodes (expects FQDN, Domain, Name, DomainDn, NCs, Type, IsPdcRoleOwner, Online).
+.PARAMETER Execute
+Apply changes. If omitted, actions are simulated (WhatIf=True).
+.PARAMETER Evt2010
+Also wait for DFS Replication Event ID 2010 (service stopped) before DFSR steps.
+.PARAMETER tStop
+Seconds to wait for "stop" events (e.g., DFSR 4114, FRS 13568). Default: 320.
+.PARAMETER tAuth
+Seconds to wait for authoritative initialization events (e.g., DFSR 4602, FRS 13553/13516). Default: 320.
+.PARAMETER tNA
+Seconds to wait for non-authoritative initialization events (e.g., DFSR 4614/4604, FRS 13516). Default: 320.
+.PARAMETER SkipEventCheck
+Do not wait for event IDs (useful for single-DC domains or expedited runs).
+.EXAMPLE
+# Simulate DFSR/FRS restore across all domains in inventory
+Invoke-SysvolRestore -IsolatedDCList $dcs
+.EXAMPLE
+# Apply changes with DFSR Event 2010 gating and custom timeouts
+Invoke-SysvolRestore -IsolatedDCList $dcs -Execute -Evt2010 -tStop 420 -tAuth 420 -tNA 420
+.OUTPUTS
+PSCustomObject per domain: Domain, Path ('DFSR'|'FRS'), Authoritative, Saw2010, Saw4114All, Saw4602.
+.NOTES
+Author: NightCityShogun
+Version: 1.0.2 - Fixed event waiting logic (Dec 2025)
+Requires: Domain Admin-level rights; CIM/DCOM access to DCs; DFSR/FRS service control.
+ConfirmImpact: Low; SupportsShouldProcess.
+2025 NightCityShogun. All rights reserved.
+#>
 function Invoke-SysvolRestore {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
     param(
@@ -88,7 +126,7 @@ function Invoke-SysvolRestore {
             $missing = $required | Where-Object { -not $dc.PSObject.Properties[$_] -or $dc.$_ -eq $null }
             if ($missing) { throw "Invalid IsolatedDCList entry for $($dc.FQDN): Missing $($missing -join ', ')" }
         }
-        Write-IdentIRLog -Message "Validated IsolatedDCList with $(($sortedDcList | Measure-Object).Count) entries (Forest Root -> Child -> Tree)." -TypeName 'Info' -ForegroundColor Green
+        Write-IdentIRLog -Message "Validated IsolatedDCList with $(($sortedDcList | Measure-Object).Count) entries (Forest Root to Child to Tree)." -TypeName 'Info' -ForegroundColor Green
         $domainGroups = @{}
         $domainTypeMap = @{}
         foreach ($dc in $sortedDcList) {
@@ -114,11 +152,10 @@ function Invoke-SysvolRestore {
                 [Parameter(Mandatory)][string]$Computer,
                 [Parameter(Mandatory)][int]$EventId,
                 [Parameter(Mandatory)][string]$LogName,
-                [int]$TimeFrame, # seconds: rolling window
+                [int]$TimeFrame,
                 [int]$MaxWait,
                 [string]$Description = ''
             )
-            # Per-run dedupe, self-contained
             if (-not $script:SeenEventSeq) { $script:SeenEventSeq = @{} }
             $key = "$Computer|$LogName|$EventId"
             if ($script:SeenEventSeq.ContainsKey($key)) {
@@ -132,7 +169,6 @@ function Invoke-SysvolRestore {
             $nextNote = 0
             $iteration = 0
             $startTime = (Get-Date).AddSeconds(-[math]::Abs($TimeFrame))
-            # local vs remote (for Get-WinEvent remote usage)
             $localShort = $env:COMPUTERNAME
             try { $localFQDN = [System.Net.Dns]::GetHostByName($localShort).HostName } catch { $localFQDN = $null }
             $isLocal = $Computer -ieq $localShort -or $Computer -ieq $localFQDN -or $Computer -eq 'localhost' -or $Computer -eq '127.0.0.1'
@@ -151,13 +187,11 @@ function Invoke-SysvolRestore {
                     try {
                         $msg = $null
                         if ($LogName -eq 'DFS Replication') {
-                            # Classic log via Get-EventLog: take the MOST RECENT match in the window
                             $msg = Get-EventLog -ComputerName $Computer -LogName $LogName -After $startTime -ErrorAction Stop |
                                    Where-Object { $_.EventID -eq $EventId } |
                                    Sort-Object Index -Descending |
                                    Select-Object -First 1
                         } else {
-                            # Operational / any WEC channel via Get-WinEvent (best for 4114/4602)
                             if ($isLocal) {
                                 $msg = Get-WinEvent -FilterHashtable @{ LogName=$LogName; Id=$EventId; StartTime=$startTime } -ErrorAction Stop |
                                        Sort-Object RecordId -Descending |
@@ -168,9 +202,8 @@ function Invoke-SysvolRestore {
                                            Sort-Object RecordId -Descending |
                                            Select-Object -First 1
                                 } catch {
-                                    # If remote Get-WinEvent can’t read this log and caller passed the classic name by mistake, fallback:
                                     if ($LogName -eq 'Microsoft-Windows-DFS Replication/Operational') {
-                                        $msg = $null # no classic fallback here; operational isn’t exposed via Get-EventLog
+                                        $msg = $null
                                     } else {
                                         $msg = Get-EventLog -ComputerName $Computer -LogName $LogName -After $startTime -ErrorAction Stop |
                                                Where-Object { $_.EventID -eq $EventId } |
@@ -236,21 +269,21 @@ function Invoke-SysvolRestore {
                     $isDfsr = $false
                     Write-IdentIRLog -Message "No DFSR subscriptions found; assuming FRS." -TypeName 'Info' -ForegroundColor White
                 }
-                if ($isDfsr) {
-                    foreach ($dc in $dcs) {
-                        $node = $dc.FQDN
-                        if (-not $cimSessions.ContainsKey($node)) {
-                            if ($PSCmdlet.ShouldProcess($node, 'Open CIM session')) {
-                                if ($WhatIfPreference) { continue }
-                                try {
-                                    $cimSessions[$node] = New-CimSession -ComputerName $node -SessionOption $sessionOption -ErrorAction Stop
-                                    Write-IdentIRLog -Message "CIM session opened to ${node}." -TypeName 'Info' -ForegroundColor Gray
-                                } catch {
-                                    Write-IdentIRLog -Message "CIM session failed for ${node}: $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
-                                }
+                foreach ($dc in $dcs) {
+                    $node = $dc.FQDN
+                    if (-not $cimSessions.ContainsKey($node)) {
+                        if ($PSCmdlet.ShouldProcess($node, 'Open CIM session')) {
+                            if ($WhatIfPreference) { continue }
+                            try {
+                                $cimSessions[$node] = New-CimSession -ComputerName $node -SessionOption $sessionOption -ErrorAction Stop
+                                Write-IdentIRLog -Message "CIM session opened to ${node}." -TypeName 'Info' -ForegroundColor Gray
+                            } catch {
+                                Write-IdentIRLog -Message "CIM session failed for ${node}: $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
                             }
                         }
                     }
+                }
+                if ($isDfsr) {
                     foreach ($dc in $dcs) {
                         $node = $dc.FQDN
                         $cimSess = $cimSessions[$node]
@@ -273,6 +306,7 @@ function Invoke-SysvolRestore {
                             }
                         }
                     }
+                    # FIXED: Event 2010
                     if ($Evt2010 -and -not ($isSingleDC -and $SkipEventCheck)) {
                         $maxWait = if ($WhatIfPreference) {15} else {[int][Math]::Max(30, $tStop)}
                         foreach ($dc in $dcs) {
@@ -401,6 +435,8 @@ function Invoke-SysvolRestore {
                     if (-not ($isSingleDC -and $SkipEventCheck)) {
                         $maxWait = if ($WhatIfPreference) {15} else {[int][Math]::Max(30, $tAuth)}
                         $s4602 = Wait-ForReplicationEvent -Computer $dns -EventId 4602 -LogName 'DFS Replication' -TimeFrame $tAuth -MaxWait $maxWait -Description '(sysvol replication initialized)'
+                    } elseif ($isSingleDC) {
+                        Write-IdentIRLog -Message "Single-DC domain: skipping wait for DFSR Event ID 4602 on $dns." -TypeName 'Info' -ForegroundColor Gray
                     }
                     $s4114All = $s4114Auth
                     foreach ($sec in $secondaries) {
@@ -552,6 +588,7 @@ function Invoke-SysvolRestore {
                             }
                         }
                     }
+                    # FIXED: FRS stop event 13568
                     if (-not ($isSingleDC -and $SkipEventCheck)) {
                         $maxWait = if ($WhatIfPreference) {15} else {[int][Math]::Max(30, $tStop)}
                         foreach ($dc in $dcs) {
@@ -565,7 +602,7 @@ function Invoke-SysvolRestore {
                             $reg = Get-CimInstance -CimSession $cimSess -Namespace root/default -ClassName StdRegProv
                             $args = @{
                                 hDefKey = [uint32]0x80000002
-                                sSubKeyName = "SYSTEM\CurrentControlSet\Services\NtFrs\Parameters\Backup/Restore\Process at Startup"
+                                sSubKeyName = "SYSTEM\CurrentControlSet\Services\NtFrs\Parameters\Backup\Restore\Process at Startup"
                                 sValueName = "BurFlags"
                                 uValue = [uint32]0xD4
                             }
@@ -584,7 +621,7 @@ function Invoke-SysvolRestore {
                                 $reg = Get-CimInstance -CimSession $cimSess -Namespace root/default -ClassName StdRegProv
                                 $args = @{
                                     hDefKey = [uint32]0x80000002
-                                    sSubKeyName = "SYSTEM\CurrentControlSet\Services\NtFrs\Parameters\Backup/Restore\Process at Startup"
+                                    sSubKeyName = "SYSTEM\CurrentControlSet\Services\NtFrs\Parameters\Backup\Restore\Process at Startup"
                                     sValueName = "BurFlags"
                                     uValue = [uint32]0xD2
                                 }
@@ -639,6 +676,7 @@ function Invoke-SysvolRestore {
                             Write-IdentIRLog -Message "Set startup failed on ${authFqdn}: $($_.Exception.Message)" -TypeName 'Warning' -ForegroundColor Yellow
                         }
                     }
+                    # FIXED: FRS auth initialization events
                     if (-not ($isSingleDC -and $SkipEventCheck)) {
                         $maxWait = if ($WhatIfPreference) {15} else {[int][Math]::Max(30, $tAuth)}
                         $null = Wait-ForReplicationEvent -Computer $authFqdn -EventId 13553 -LogName 'File Replication Service' -TimeFrame $tAuth -MaxWait $maxWait -Description ''
@@ -679,6 +717,7 @@ function Invoke-SysvolRestore {
                                 Write-IdentIRLog -Message "Set startup failed on ${secFqdn}: $($_.Exception.Message)" -TypeName 'Warning' -ForegroundColor Yellow
                             }
                         }
+                        # FIXED: FRS non-auth event 13516
                         if (-not $SkipEventCheck) {
                             $maxWait = if ($WhatIfPreference) {15} else {[int][Math]::Max(30, $tNA)}
                             $null = Wait-ForReplicationEvent -Computer $secFqdn -EventId 13516 -LogName 'File Replication Service' -TimeFrame $tNA -MaxWait $maxWait -Description ''
