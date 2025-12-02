@@ -77,11 +77,11 @@
 
     .NOTES
     Author:  NightCityShogun
-    Version: 1.9
-    Requires: PowerShell 5.1+, System.DirectoryServices, System.DirectoryServices.ActiveDirectory
+    Version: 2.1 (ADSI-only)
+    Requires: PowerShell 5.1+, System.DirectoryServices
     Privileges: Domain / Enterprise admin privileges recommended for full visibility.
     © 2025 NightCityShogun. All rights reserved.
-    #>
+#>
 function Get-ForestInfo {
     [CmdletBinding()]
     param(
@@ -94,7 +94,6 @@ function Get-ForestInfo {
         $domainList = New-Object 'System.Collections.Generic.List[PSObject]'
 
         [void][System.Reflection.Assembly]::LoadWithPartialName('System.DirectoryServices')
-        [void][System.Reflection.Assembly]::LoadWithPartialName('System.DirectoryServices.ActiveDirectory')
         [void][System.Reflection.Assembly]::LoadWithPartialName('System.Core')
 
         $searcher    = $null
@@ -107,18 +106,8 @@ function Get-ForestInfo {
                 Write-IdentIRLog -Message "Starting forest discovery." -TypeName "Info" -ForegroundColor White
             }
 
-            $forest           = $null
             $rootDSE          = $null
             $forestRootDomain = $null
-
-            # Try to resolve forest via current context (non-fatal if it fails)
-            try {
-                $forest = [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
-            } catch {
-                if (-not $WinStyleHidden) {
-                    Write-IdentIRLog -Message "Get-ForestInfo: GetCurrentForest() failed, continuing with RootDSE only: $($_.Exception.Message)" -TypeName "Warning" -ForegroundColor Yellow
-                }
-            }
 
             $rootDsePath = "LDAP://RootDSE"
             if ($Credential) {
@@ -143,22 +132,18 @@ function Get-ForestInfo {
                 return
             }
 
-            # Forest root domain: prefer Forest object, fall back to RootDSE
-            if ($forest) {
-                $forestRootDomain = $forest.RootDomain.Name.ToLower()
-            } else {
-                try {
-                    $rootDomainNC = $rootDSE.Properties['rootDomainNamingContext'][0].ToString()
-                    $forestRootDomain = (
-                        $rootDomainNC -split ',' |
-                        Where-Object { $_ -like 'DC=*' } |
-                        ForEach-Object { $_ -replace '^DC=' }
-                    ) -join '.'
-                    $forestRootDomain = $forestRootDomain.ToLower()
-                } catch {
-                    Write-IdentIRLog -Message "Get-ForestInfo: Unable to derive forest root domain: $($_.Exception.Message)" -TypeName "Error" -ForegroundColor Red
-                    return
-                }
+            # Forest root domain from RootDSE (no ActiveDirectory.Forest)
+            try {
+                $rootDomainNC = $rootDSE.Properties['rootDomainNamingContext'][0].ToString()
+                $forestRootDomain = (
+                    $rootDomainNC -split ',' |
+                    Where-Object { $_ -like 'DC=*' } |
+                    ForEach-Object { $_ -replace '^DC=' }
+                ) -join '.'
+                $forestRootDomain = $forestRootDomain.ToLower()
+            } catch {
+                Write-IdentIRLog -Message "Get-ForestInfo: Unable to derive forest root domain: $($_.Exception.Message)" -TypeName "Error" -ForegroundColor Red
+                return
             }
 
             $configNC = $rootDSE.Properties['configurationNamingContext'][0].ToString()
@@ -250,6 +235,72 @@ function Get-ForestInfo {
                     }
                 }
 
+                # Site from serverDN (CN=Server,CN=Servers,CN=<Site>,CN=Sites,...)
+                $site = $null
+                try {
+                    $parts = $serverDN -split ','
+                    if ($parts.Length -ge 3) {
+                        $site = $parts[2] -replace '^CN=', ''
+                    }
+                } catch { }
+
+                # DomainDN + Domain name (from serverReference -> computer DN)
+                $domainDN   = $null
+                $domainName = "Unknown"
+                try {
+                    if ($serverEntry -and $serverEntry.serverReference) {
+                        $srvRef = $serverEntry.serverReference
+                        if ($srvRef) {
+                            $domainDN = ($srvRef -split ',' | Where-Object { $_ -like 'DC=*' }) -join ','
+                        }
+                    }
+                    if ($domainDN) {
+                        $domainName = (
+                            $domainDN -split ',' |
+                            Where-Object { $_ -like 'DC=*' } |
+                            ForEach-Object { $_ -replace '^DC=' }
+                        ) -join '.'
+                    }
+                } catch { }
+
+                # Type classification based on forest root
+                $dcType = "Unknown"
+                if ($domainName -ne "Unknown") {
+                    $lowerDomain = $domainName.ToLower()
+                    if ($lowerDomain -eq $forestRootDomain) {
+                        $dcType = "Forest Root"
+                    } elseif ($lowerDomain.EndsWith(".$forestRootDomain")) {
+                        $dcType = "Child Domain"
+                    } else {
+                        $dcType = "Tree Root"
+                    }
+                }
+
+                # ---------- Pre-check: DNS + LDAP 389 ----------
+                $ipv4   = $null
+                $online = $false
+
+                try {
+                    $ipAddrs = [System.Net.Dns]::GetHostAddresses($fqdn) |
+                               Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }
+
+                    if ($ipAddrs -and $ipAddrs.Count -gt 0) {
+                        $ipv4 = ($ipAddrs | ForEach-Object { $_.IPAddressToString }) -join ', '
+
+                        # Only probe 389 if DNS resolved
+                        $tcp = New-Object System.Net.Sockets.TcpClient
+                        $ar  = $tcp.BeginConnect($fqdn, 389, $null, $null)
+                        if ($ar.AsyncWaitHandle.WaitOne(250, $false) -and $tcp.Connected) {
+                            $tcp.EndConnect($ar)
+                            $online = $true
+                        }
+                    }
+                } catch {
+                    # DNS/port failures just mean $online stays $false
+                } finally {
+                    if ($tcp) { $tcp.Close() }
+                }
+
                 $workItems += [PSCustomObject]@{
                     NtdsDN         = $ntdsDN
                     ServerDN       = $serverDN
@@ -257,12 +308,23 @@ function Get-ForestInfo {
                     DnsGuid        = $dnsGuid
                     ConfigNC       = $configNC
                     ForestRootFQDN = $forestRootDomain
+                    IPv4           = $ipv4
+                    Online         = $online
+                    Site           = $site
+                    DomainDN       = $domainDN
+                    DomainName     = $domainName
+                    DcType         = $dcType
                 }
             }
 
             if ($workItems.Count -eq 0) {
                 Write-IdentIRLog -Message "Get-ForestInfo: No valid NTDS/Server pairs discovered in the forest." -TypeName "Error" -ForegroundColor Red
                 return
+            }
+
+            $offlineCount = ($workItems | Where-Object { -not $_.Online }).Count
+            if (-not $WinStyleHidden -and $offlineCount -gt 0) {
+                Write-IdentIRLog -Message ("Get-ForestInfo: {0} DCs appear offline (no DNS/389 response). They will be returned with limited data." -f $offlineCount) -TypeName "Warning" -ForegroundColor Yellow
             }
 
             # -------- Dynamic concurrency if not specified --------
@@ -309,68 +371,48 @@ function Get-ForestInfo {
                     $dnsGuid        = $WorkItem.DnsGuid
                     $configNC       = $WorkItem.ConfigNC
                     $forestRootFQDN = $WorkItem.ForestRootFQDN
+                    $ipv4Hint       = $WorkItem.IPv4
+                    $online         = [bool]$WorkItem.Online
+                    $site           = $WorkItem.Site
+                    $domainDN       = $WorkItem.DomainDN
+                    $domainName     = $WorkItem.DomainName
+                    $dcType         = $WorkItem.DcType
 
                     if (-not $ntdsDN -or -not $serverDN -or -not $fqdn) {
                         return $null
                     }
 
-                    # ---------- 1) Online test (LDAP 389, 500ms) ----------
-                    $online = $false
-                    try {
-                        $tcp = New-Object System.Net.Sockets.TcpClient
-                        $ar  = $tcp.BeginConnect($fqdn, 389, $null, $null)
-                        if ($ar.AsyncWaitHandle.WaitOne(500, $false) -and $tcp.Connected) {
-                            $tcp.EndConnect($ar)
-                            $online = $true
+                    # ---------- Offline DCs: return lightweight object, no per-DC LDAP binds ----------
+                    if (-not $online) {
+                        $ipv4 = if ($ipv4Hint) { $ipv4Hint } else { "Unknown" }
+
+                        return [PSCustomObject]@{
+                            Type                       = $dcType
+                            Domain                     = $domainName
+                            DomainSid                  = $null
+                            Site                       = $site
+                            SamAccountName             = $null
+                            NetBIOS                    = $null
+                            FQDN                       = $fqdn
+                            IsGC                       = $false
+                            IsRODC                     = $false
+                            IPv4Address                = $ipv4
+                            Online                     = $false
+                            DistinguishedName          = $null
+                            ServerReferenceBL          = $ntdsDN
+                            IsPdcRoleOwner             = $false
+                            DefaultNamingContext       = $domainDN
+                            ConfigurationNamingContext = $configNC
+                            DnsGuid                    = $dnsGuid
+                            ForestRootFQDN             = $forestRootFQDN
                         }
-                    } catch {
-                    } finally {
-                        if ($tcp) { $tcp.Close() }
                     }
 
-                    # ---------- 2) Server entry (Configuration NC) ----------
-                    if ($Cred) {
-                        $serverEntry = New-Object System.DirectoryServices.DirectoryEntry(
-                            "LDAP://$serverDN",
-                            $Cred.UserName,
-                            $Cred.GetNetworkCredential().Password
-                        )
-                    } else {
-                        $serverEntry = [ADSI]"LDAP://$serverDN"
-                    }
+                    # ---------- Online DCs: full LDAP/GC enumeration ----------
 
-                    # Site from serverDN (CN=Server,CN=<Site>,CN=Servers,...)
-                    $site = $null
-                    try {
-                        $parts = $serverDN -split ','
-                        if ($parts.Length -ge 3) {
-                            $site = $parts[2] -replace '^CN=', ''
-                        }
-                    } catch { }
-
-                    # ---------- 3) Domain DN + name ----------
-                    $domainDN   = $null
-                    $domainName = "Unknown"
-                    try {
-                        if ($serverEntry -and $serverEntry.serverReference) {
-                            $srvRef = $serverEntry.serverReference
-                            if ($srvRef) {
-                                $domainDN = ($srvRef -split ',' | Where-Object { $_ -like 'DC=*' }) -join ','
-                            }
-                        }
-                        if ($domainDN) {
-                            $domainName = (
-                                $domainDN -split ',' |
-                                Where-Object { $_ -like 'DC=*' } |
-                                ForEach-Object { $_ -replace '^DC=' }
-                            ) -join '.'
-                        }
-                    } catch { }
-
-                    # ---------- 4) Domain entry (SID + FSMO) ----------
+                    # 1) Domain entry (SID + FSMO) pinned to this DC
                     $domainEntry = $null
                     if ($domainDN) {
-                        # Pin to this DC's FQDN so we do not depend on DC Locator
                         if ($fqdn) {
                             $ldapPath = "LDAP://$fqdn/$domainDN"
                         } else {
@@ -408,7 +450,7 @@ function Get-ForestInfo {
                         } catch { }
                     }
 
-                    # ---------- 5) Computer object (DC) ----------
+                    # 2) Computer object (DC)
                     $dcName            = $null
                     $samAccountName    = $null
                     $distinguishedName = $null
@@ -418,7 +460,6 @@ function Get-ForestInfo {
                     if ($domainDN) {
                         $compSearcher = New-Object System.DirectoryServices.DirectorySearcher
 
-                        # Pin search root to this DC
                         if ($fqdn) {
                             $searchRootPath = "LDAP://$fqdn/$domainDN"
                         } else {
@@ -435,10 +476,10 @@ function Get-ForestInfo {
                             $searchRoot = New-Object System.DirectoryServices.DirectoryEntry($searchRootPath)
                         }
 
-                        $compSearcher.SearchRoot = $searchRoot
-                        $compSearcher.Filter = "(&(objectCategory=computer)(dNSHostName=$fqdn))"
+                        $compSearcher.SearchRoot  = $searchRoot
+                        $compSearcher.Filter      = "(&(objectCategory=computer)(dNSHostName=$fqdn))"
                         $compSearcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
-                        $compSearcher.PageSize = 1
+                        $compSearcher.PageSize    = 1
                         [void]$compSearcher.PropertiesToLoad.Add("name")
                         [void]$compSearcher.PropertiesToLoad.Add("sAMAccountName")
                         [void]$compSearcher.PropertiesToLoad.Add("distinguishedName")
@@ -470,20 +511,12 @@ function Get-ForestInfo {
                         }
                     }
 
-                    # ---------- 6) IPv4 resolution ----------
-                    $ipv4 = "Unknown"
-                    try {
-                        $addrs = [System.Net.Dns]::GetHostAddresses($fqdn) |
-                                 Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
-                                 ForEach-Object { $_.IPAddressToString }
-                        if ($addrs -and $addrs.Count -gt 0) {
-                            $ipv4 = ($addrs -join ", ")
-                        }
-                    } catch { }
+                    # 3) IPv4: use pre-computed hint
+                    $ipv4 = if ($ipv4Hint) { $ipv4Hint } else { "Unknown" }
 
-                    # ---------- 7) Type classification ----------
-                    $type = "Unknown"
-                    if ($domainName -ne "Unknown") {
+                    # 4) Type classification (already done, but keep in case domainName changed)
+                    $type = $dcType
+                    if (($type -eq "Unknown") -and $domainName -ne "Unknown") {
                         $lowerDomain = $domainName.ToLower()
                         if ($lowerDomain -eq $forestRootFQDN) {
                             $type = "Forest Root"
