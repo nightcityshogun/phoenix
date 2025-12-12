@@ -1,13 +1,29 @@
+<#
+.SYNOPSIS
+
+.DESCRIPTION
+
+.PARAMETER 
+
+.PARAMETER Length
+
+
+.EXAMPLE
+# 
+
+.EXAMPLE
+# 
+.OUTPUTS
+
+
+.NOTES
+Author: NightCityShogun
+Version: 1.0
+SupportsShouldProcess: True
+(c) 2025 NightCityShogun. All rights reserved.
+#>
 function Connect-MicrosoftAzure {
-    <#
-    .SYNOPSIS
-        Acquires a Microsoft Graph access token using OAuth2 (REST only)
-    #>
-function Connect-MicrosoftAzure {
-    <#
-    .SYNOPSIS
-        Acquires a Microsoft Graph access token using OAuth2 (REST only).
-    #>
+
     [CmdletBinding(DefaultParameterSetName = 'Certificate')]
     param(
         [Parameter(Mandatory = $false)]
