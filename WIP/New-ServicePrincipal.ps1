@@ -37,15 +37,32 @@ function New-ServicePrincipal {
     )
 
     $appRequiredPermissions = @(
-        "Application.Read.All",
+        "Application.ReadWrite.All",
         "DelegatedPermissionGrant.Read.All",
+        "Directory.AccessAsUser.All",
+        "Directory.Read.All",
+        "Directory.ReadWrite.All",
         "Group.Read.All",
+        "Group.ReadWrite.All",
         "GroupMember.Read.All",
-        "RoleManagement.Read.Directory",
-        "RoleEligibilitySchedule.Read.Directory",
-        "RoleAssignmentSchedule.Read.Directory",
+        "Organization.Read.All",
+        "Policy.Read.All",
+        "Policy.ReadWrite.ConditionalAccess",
+        "Policy.ReadWrite.SecurityDefaults",
         "PrivilegedAccess.Read.AzureADGroup",
-        "User.Read.All"
+        "RoleAssignmentSchedule.Read.Directory",
+        "RoleAssignmentSchedule.Remove.Directory",
+        "RoleEligibilitySchedule.Read.Directory",
+        "RoleEligibilitySchedule.ReadWrite.Directory",
+        "RoleEligibilitySchedule.Remove.Directory",
+        "RoleManagement.Read.All",
+        "RoleManagement.Read.Directory",
+        "RoleManagement.ReadWrite.Directory",
+        "UserAuthenticationMethod.Read.All",
+        "UserAuthenticationMethod.ReadWrite",
+        "UserAuthenticationMethod.ReadWrite.All",
+        "User.Read.All",
+        "User.ReadBasic.All"
     )
 
     if (-not (Test-Path -LiteralPath $CertificatePath)) {
