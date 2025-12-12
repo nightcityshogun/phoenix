@@ -1,3 +1,28 @@
+<#
+.SYNOPSIS
+
+.DESCRIPTION
+
+.PARAMETER 
+
+.PARAMETER Length
+
+
+.EXAMPLE
+# 
+
+.EXAMPLE
+# 
+.OUTPUTS
+
+
+.NOTES
+Author: NightCityShogun
+Version: 1.0
+SupportsShouldProcess: True
+(c) 2025 NightCityShogun. All rights reserved.
+#>
+
 function New-ServicePrincipal {
     [CmdletBinding()]
     param(
