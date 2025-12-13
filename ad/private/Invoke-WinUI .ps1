@@ -238,9 +238,6 @@ function Invoke-WinUI {
         $script:menuButtons += $btn
     }
 
-    # ==========================
-    # Dialogs & helpers
-    # ==========================
 
     function Show-PasswordDialog {
         $dialog = New-Object System.Windows.Window
@@ -524,450 +521,776 @@ function Invoke-WinUI {
         }
     }
 
-    # Enumerate OUs and containers for a given domain using discovered DCs (flat list)
-    function Get-DomainOUsForDomain {
-        param(
-            [Parameter(Mandatory = $true)]
-            [string] $DomainName,
-
-            [Parameter(Mandatory = $true)]
-            [object[]] $DcList
-        )
-
-        $domainDC = $DcList |
-            Where-Object { $_.Domain -ieq $DomainName -and $_.Online } |
-            Select-Object -First 1
-
-        if (-not $domainDC) {
-            return @()
+    function Set-CurrentPassword {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param (
+        [System.Management.Automation.PSCredential] $Credential,
+        [switch] $Execute,
+        [SecureString] $Password
+    )
+    $oldConfirm = $script:ConfirmPreference
+    $script:ConfirmPreference = 'None'
+    $oldWhatIf = $WhatIfPreference
+    $WhatIfPreference = -not [bool]$Execute
+    try {
+        $ErrorActionPreference = 'Stop'
+        Set-StrictMode -Version Latest
+        # Current session identity
+        $currentUsername = $env:USERNAME
+        if (-not $currentUsername) {
+            Write-IdentIRLog -Message 'Unable to determine the currently logged-on username.' -TypeName 'Error' -ForegroundColor Red
+            return $false
         }
-
-        $searcher = New-Object System.DirectoryServices.DirectorySearcher
-        $searcher.SearchRoot = [ADSI]"LDAP://$($domainDC.FQDN)/$($domainDC.DefaultNamingContext)"
-        # include both OU and container objects so everything like CN=Users, CN=Computers, etc. appears
-        $searcher.Filter = "(|(objectClass=organizationalUnit)(objectClass=container))"
-        $searcher.SearchScope = "Subtree"
-        $searcher.PropertiesToLoad.Add("name")              | Out-Null
-        $searcher.PropertiesToLoad.Add("distinguishedName") | Out-Null
-        $searcher.PageSize = 1000
-
-        $results = $searcher.FindAll()
-
-        $ous = foreach ($ou in $results) {
-            $dn   = $ou.Properties["distinguishedname"][0]
-            $name = $ou.Properties["name"][0]
-
-            [PSCustomObject]@{
-                Name              = $name
-                DistinguishedName = $dn
+        # Authenticating DC (LOGONSERVER)
+        $logonServerNetBIOS = $env:LOGONSERVER -replace '^\\\\',''
+        if (-not $logonServerNetBIOS) {
+            Write-IdentIRLog -Message 'Unable to determine the authenticating domain controller (LOGONSERVER).' -TypeName 'Error' -ForegroundColor Red
+            return $false
+        }
+        # FQDN (fallback to NetBIOS)
+        try { $logonServerFQDN = [System.Net.Dns]::GetHostEntry($logonServerNetBIOS).HostName }
+        catch { $logonServerFQDN = $logonServerNetBIOS; Write-IdentIRLog -Message "FQDN resolution failed for '$logonServerNetBIOS'; using NetBIOS." -TypeName 'Warning' -ForegroundColor Yellow }
+        # RootDSE: ensure sync; get domain DN
+        $rootDSEPath = "LDAP://$logonServerFQDN/RootDSE"
+        $rootDSE = if ($Credential) {
+            New-Object System.DirectoryServices.DirectoryEntry($rootDSEPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        } else { [ADSI]$rootDSEPath }
+        if ($rootDSE.Properties['isSynchronized'][0] -ne $true) {
+            Write-IdentIRLog -Message "Authenticating DC '$logonServerFQDN' is not synchronized." -TypeName 'Error' -ForegroundColor Red
+            return $false
+        }
+        $domainDN = $rootDSE.Properties['defaultNamingContext'][0]
+        if (-not $domainDN) {
+            Write-IdentIRLog -Message "defaultNamingContext missing on '$logonServerFQDN'." -TypeName 'Error' -ForegroundColor Red
+            return $false
+        }
+        $domainName = ($domainDN -replace 'DC=','' -replace ',', '.')
+        Write-IdentIRLog -Message "Identified session: User='$currentUsername', Domain='$domainName', DC='$logonServerFQDN' (WhatIf=$WhatIfPreference)" -TypeName 'Info' -ForegroundColor Cyan
+        # Locate current user
+        $searchRootPath = "LDAP://$logonServerFQDN/$domainDN"
+        $searchRoot = if ($Credential) {
+            New-Object System.DirectoryServices.DirectoryEntry($searchRootPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        } else { [ADSI]$searchRootPath }
+        $ds = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
+        $ds.Filter = "(&(objectClass=user)(sAMAccountName=$currentUsername))"
+        $ds.PageSize = 1
+        $ds.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+        $res = $ds.FindOne()
+        if (-not $res) {
+            Write-IdentIRLog -Message "User '$currentUsername' not found in '$domainName'." -TypeName 'Error' -ForegroundColor Red
+            return $false
+        }
+        $userDN = $res.Properties['distinguishedName'][0]
+        $userPath = "LDAP://$logonServerFQDN/$userDN"
+        $userDE = if ($Credential) {
+            New-Object System.DirectoryServices.DirectoryEntry($userPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        } else { [ADSI]$userPath }
+        $confirmTarget = "$userDN on $logonServerFQDN"
+        # WhatIf: emit native line but don't treat as cancel
+        if ($WhatIfPreference) {
+            $null = $PSCmdlet.ShouldProcess($confirmTarget, "Reset password for current user")
+            Write-IdentIRLog -Message "[WhatIf] Would reset password for '$currentUsername' in '$domainName'." -TypeName 'Info' -ForegroundColor Green
+            return $true
+        }
+        if (-not $PSCmdlet.ShouldProcess($confirmTarget, "Reset password for current user")) {
+            Write-IdentIRLog -Message "Operation cancelled." -TypeName 'Warning' -ForegroundColor Yellow
+            return $false
+        }
+        $newSecure = $null
+        if ($Password) {
+            $newSecure = $Password
+        } else {
+            while ($true) {
+                $p1 = Read-Host "Enter a new password for '$currentUsername'" -AsSecureString
+                $p2 = Read-Host "Re-enter the new password for '$currentUsername'" -AsSecureString
+                $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1)
+                $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2)
+                $s1 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b1)
+                $s2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b2)
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1)
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2)
+                if ($s1 -ne $s2) { Write-Warning "Passwords do not match. Try again."; continue }
+                $newSecure = $p1
+                # Clear plaintext copies
+                $s1 = $null; $s2 = $null
+                break
             }
         }
+        # Convert to plaintext ONLY for the call, then zero it
+        $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($newSecure)
+        $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b)
+        $ok = $false
+        for ($i=1; $i -le 2; $i++) {
+            try {
+                # IMPORTANT: Invoke SetPassword with a *string* argument
+                $userDE.psbase.Invoke('SetPassword', @($plain))
+                # Optional but harmless:
+                $userDE.CommitChanges()
+                $ok = $true
+                break
+            } catch {
+                if ($i -eq 2) {
+                    Write-IdentIRLog -Message "Password reset failed for '$currentUsername' on '$logonServerFQDN': $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
+                    return $false
+                }
+                Start-Sleep -Milliseconds 400
+            }
+        }
+        if ($b) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
+        $plain = $null
+        # Purge Kerberos tickets (best-effort)
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = 'klist'
+            $psi.Arguments = 'purge'
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.CreateNoWindow = $true
+            $p = [System.Diagnostics.Process]::Start($psi); $p.WaitForExit(); $p.Dispose()
+            Write-IdentIRLog -Message 'Kerberos tickets purged.' -TypeName 'Info' -ForegroundColor Gray
+        } catch {
+            Write-IdentIRLog -Message 'Kerberos ticket purge encountered a non-critical error.' -TypeName 'Warning' -ForegroundColor Yellow
+        }
+        Write-IdentIRLog -Message "Password reset completed for '$currentUsername' in '$domainName'." -TypeName 'Info' -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-IdentIRLog -Message "Set-CurrentPassword error: $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
+        return $false
+    }
+    finally {
+        $script:ConfirmPreference = $oldConfirm
+        $WhatIfPreference = $oldWhatIf
+    }
+}
 
-        $results.Dispose()
-        return ($ous | Sort-Object DistinguishedName)
+    function Get-DomainOUsForDomain {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $DomainName,
+
+        [Parameter(Mandatory = $true)]
+        [object[]] $DcList,
+
+        # IMPORTANT: pass the same credential you used for discovery (if any)
+        [Parameter()]
+        [System.Management.Automation.PSCredential] $Credential
+    )
+
+    # Pick best DC for this domain (prefer PDC if online)
+    $domainDC = $DcList |
+        Where-Object { $_.Domain -ieq $DomainName -and $_.Online } |
+        Sort-Object @{ Expression = { [int]$_.IsPdcRoleOwner }; Descending = $true }, FQDN |
+        Select-Object -First 1
+
+    if (-not $domainDC) {
+        return @()
     }
 
+    $dcFqdn   = $domainDC.FQDN
+    $domainNC = $domainDC.DefaultNamingContext
+    if (-not $domainNC) { return @() }
+
+    # Build a DirectoryEntry we can use across domains (with creds if provided)
+    function New-LdapEntry {
+        param(
+            [Parameter(Mandatory)]
+            [string] $LdapPath
+        )
+
+        if ($Credential) {
+            return New-Object System.DirectoryServices.DirectoryEntry(
+                $LdapPath,
+                $Credential.UserName,
+                $Credential.GetNetworkCredential().Password
+            )
+        }
+
+        return New-Object System.DirectoryServices.DirectoryEntry($LdapPath)
+    }
+
+    # Reliable “OneLevel + recurse” enumeration (like your WinForms version),
+    # but includes BOTH OUs and containers + Builtin (builtinDomain) + LostAndFound.
+    function Get-ChildrenOneLevel {
+        param(
+            [Parameter(Mandatory)]
+            [string] $BaseDn
+        )
+
+        $resultsOut = @()
+
+        $searchRootPath = "LDAP://$dcFqdn/$BaseDn"
+        $rootEntry = $null
+        $searcher  = $null
+        $results   = $null
+
+        try {
+            $rootEntry = New-LdapEntry -LdapPath $searchRootPath
+
+            $searcher = New-Object System.DirectoryServices.DirectorySearcher($rootEntry)
+            $searcher.SearchScope = [System.DirectoryServices.SearchScope]::OneLevel
+            $searcher.PageSize    = 1000
+
+            # Include:
+            # - OU
+            # - container (CN=Users, CN=Computers, CN=System, etc.)
+            # - builtinDomain (CN=Builtin)
+            # - lostAndFound (CN=LostAndFound)
+            $searcher.Filter = "(|(objectClass=organizationalUnit)(objectClass=container)(objectClass=builtinDomain)(objectClass=lostAndFound))"
+
+            [void]$searcher.PropertiesToLoad.Add('distinguishedName')
+            [void]$searcher.PropertiesToLoad.Add('name')
+            [void]$searcher.PropertiesToLoad.Add('objectClass')
+
+            $results = $searcher.FindAll()
+
+            foreach ($r in $results) {
+                $dn = $r.Properties['distinguishedname'][0]
+                if (-not $dn) { continue }
+
+                $name = $r.Properties['name'][0]
+                if (-not $name) {
+                    # fallback display name from the first RDN if Name is missing
+                    $name = ($dn -split ',')[0] -replace '^(OU|CN)=',''
+                }
+
+                $classes = @($r.Properties['objectclass'])
+                $class   = if ($classes.Count -gt 0) { $classes[-1] } else { $null }
+
+                # Parent DN = everything after first RDN
+                $parts = $dn -split ','
+                $parentDn = if ($parts.Length -gt 1) { ($parts[1..($parts.Length - 1)] -join ',') } else { '' }
+
+                $resultsOut += [PSCustomObject]@{
+                    Name                    = [string]$name
+                    DistinguishedName       = [string]$dn
+                    ParentDistinguishedName = [string]$parentDn
+                    ObjectClass             = [string]$class
+                    Domain                  = [string]$DomainName
+                    DC                      = [string]$dcFqdn
+                }
+            }
+        }
+        catch {
+            Write-IdentIRLog -Message "Get-DomainOUsForDomain OneLevel query failed for '$BaseDn' on '$dcFqdn': $($_.Exception.Message)" -TypeName 'Warning'
+        }
+        finally {
+            if ($results)   { $results.Dispose() }
+            if ($searcher)  { $searcher.Dispose() }
+            if ($rootEntry) { $rootEntry.Dispose() }
+        }
+
+        return $resultsOut
+    }
+
+    # Recurse from the domain naming context down
+    $all = New-Object System.Collections.Generic.List[object]
+    $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    function Walk {
+        param([Parameter(Mandatory)][string] $BaseDn)
+
+        if (-not $visited.Add($BaseDn)) { return }
+
+        $kids = Get-ChildrenOneLevel -BaseDn $BaseDn
+        foreach ($k in $kids) {
+            [void]$all.Add($k)
+            Walk -BaseDn $k.DistinguishedName
+        }
+    }
+
+    Walk -BaseDn $domainNC
+
+    # Return stable ordering for your tree builder
+    return $all.ToArray() | Sort-Object ParentDistinguishedName, Name, DistinguishedName
+}
+
     function Show-MassResetDialog {
-        $dialog = New-Object System.Windows.Window
-        $dialog.Title = "Mass Password Reset Configuration"
-        $dialog.Width = 760
-        $dialog.Height = 480
-        $dialog.WindowStartupLocation = 'CenterOwner'
-        $dialog.Owner = $form
-        $dialog.ResizeMode = 'NoResize'
-        $dialog.WindowStyle = 'SingleBorderWindow'
+    $dialog = New-Object System.Windows.Window
+    $dialog.Title = "Mass Password Reset Configuration"
+    $dialog.Width = 760
+    $dialog.Height = 480
+    $dialog.WindowStartupLocation = 'CenterOwner'
+    $dialog.Owner = $form
+    $dialog.ResizeMode = 'NoResize'
+    $dialog.WindowStyle = 'SingleBorderWindow'
 
-        # Root grid: 2 rows (content + buttons), 2 columns (left config + right OUs)
-        $root = New-Object System.Windows.Controls.Grid
-        $root.Margin = 20
+    # Root grid: 2 rows (content + buttons), 2 columns (left config + right OUs)
+    $root = New-Object System.Windows.Controls.Grid
+    $root.Margin = 20
 
-        $rowContent = New-Object System.Windows.Controls.RowDefinition
-        $rowContent.Height = '*'
-        $rowButtons = New-Object System.Windows.Controls.RowDefinition
-        $rowButtons.Height = 'Auto'
-        $root.RowDefinitions.Add($rowContent)  | Out-Null
-        $root.RowDefinitions.Add($rowButtons)  | Out-Null
+    $rowContent = New-Object System.Windows.Controls.RowDefinition
+    $rowContent.Height = '*'
+    $rowButtons = New-Object System.Windows.Controls.RowDefinition
+    $rowButtons.Height = 'Auto'
+    $root.RowDefinitions.Add($rowContent)  | Out-Null
+    $root.RowDefinitions.Add($rowButtons)  | Out-Null
 
-        $colLeft  = New-Object System.Windows.Controls.ColumnDefinition
-        $colLeft.Width = '320'
-        $colRight = New-Object System.Windows.Controls.ColumnDefinition
-        $colRight.Width = '*'
-        $root.ColumnDefinitions.Add($colLeft)  | Out-Null
-        $root.ColumnDefinitions.Add($colRight) | Out-Null
+    $colLeft  = New-Object System.Windows.Controls.ColumnDefinition
+    $colLeft.Width = '320'
+    $colRight = New-Object System.Windows.Controls.ColumnDefinition
+    $colRight.Width = '*'
+    $root.ColumnDefinitions.Add($colLeft)  | Out-Null
+    $root.ColumnDefinitions.Add($colRight) | Out-Null
 
-        # LEFT GRID (domain + keywords + password count + note)
-        $left = New-Object System.Windows.Controls.Grid
-        0..5 | ForEach-Object {    # NOTE: now 0..5 to make room for password count row
-            $row = New-Object System.Windows.Controls.RowDefinition
-            $row.Height = 'Auto'
-            $left.RowDefinitions.Add($row) | Out-Null
-        }
-        [System.Windows.Controls.Grid]::SetRow($left, 0)
-        [System.Windows.Controls.Grid]::SetColumn($left, 0)
-        $root.Children.Add($left) | Out-Null
+    # LEFT GRID (domain + keywords + password count + note)
+    $left = New-Object System.Windows.Controls.Grid
+    0..5 | ForEach-Object {
+        $row = New-Object System.Windows.Controls.RowDefinition
+        $row.Height = 'Auto'
+        $left.RowDefinitions.Add($row) | Out-Null
+    }
+    [System.Windows.Controls.Grid]::SetRow($left, 0)
+    [System.Windows.Controls.Grid]::SetColumn($left, 0)
+    $root.Children.Add($left) | Out-Null
 
-        # RIGHT GRID (OU tree)
-        $right = New-Object System.Windows.Controls.Grid
-        0..1 | ForEach-Object {
-            $row = New-Object System.Windows.Controls.RowDefinition
-            $row.Height = 'Auto'
-            $right.RowDefinitions.Add($row) | Out-Null
-        }
-        [System.Windows.Controls.Grid]::SetRow($right, 0)
-        [System.Windows.Controls.Grid]::SetColumn($right, 1)
-        $root.Children.Add($right) | Out-Null
+    # RIGHT GRID (OU tree)
+    $right = New-Object System.Windows.Controls.Grid
+    0..1 | ForEach-Object {
+        $row = New-Object System.Windows.Controls.RowDefinition
+        $row.Height = 'Auto'
+        $right.RowDefinitions.Add($row) | Out-Null
+    }
+    [System.Windows.Controls.Grid]::SetRow($right, 0)
+    [System.Windows.Controls.Grid]::SetColumn($right, 1)
+    $root.Children.Add($right) | Out-Null
 
-        # ---------- LEFT: Domain ----------
-        $lblDomain = New-Object System.Windows.Controls.TextBlock -Property @{
-            Text   = 'Select Domain:'
-            Margin = '0,0,8,6'
-        }
-        [System.Windows.Controls.Grid]::SetRow($lblDomain, 0)
-        $left.Children.Add($lblDomain) | Out-Null
+    # ---------- LEFT: Domain ----------
+    $lblDomain = New-Object System.Windows.Controls.TextBlock -Property @{
+        Text   = 'Select Domain:'
+        Margin = '0,0,8,6'
+    }
+    [System.Windows.Controls.Grid]::SetRow($lblDomain, 0)
+    $left.Children.Add($lblDomain) | Out-Null
 
-        $cmbDomain = New-Object System.Windows.Controls.ComboBox -Property @{
-            Margin = '0,0,0,6'
-        }
-        [System.Windows.Controls.Grid]::SetRow($cmbDomain, 0)
-        [System.Windows.Controls.Grid]::SetColumn($cmbDomain, 1)
-        $left.Children.Add($cmbDomain) | Out-Null
+    $cmbDomain = New-Object System.Windows.Controls.ComboBox -Property @{
+        Margin = '0,0,0,6'
+    }
+    [System.Windows.Controls.Grid]::SetRow($cmbDomain, 0)
+    [System.Windows.Controls.Grid]::SetColumn($cmbDomain, 1)
+    $left.Children.Add($cmbDomain) | Out-Null
 
-        # Populate domains from discovered DCs
-        $uniqueDomains = $script:domainListView.Items |
-            Select-Object -Property Domain -Unique |
-            Sort-Object Domain
-
-        if (-not $uniqueDomains) {
-            $message = "No domains available for selection. Ensure forest discovery has completed."
-            Write-IdentIRLog -Message $message -TypeName 'Error'
-            Write-Host $message -ForegroundColor Red
-            [System.Windows.MessageBox]::Show($message, "Error", 'OK', 'Error') | Out-Null
-            return [PSCustomObject]@{
-                Success            = $false
-                Domain             = $null
-                ExcludedOUs        = @()
-                KeywordRules       = @()
-                PasswordResetCount = 1
-            }
-        }
-
-        foreach ($dom in $uniqueDomains) {
-            $cmbDomain.Items.Add($dom.Domain) | Out-Null
-        }
-
-        # ---------- LEFT: Keyword rules ----------
-        $lblKeywords = New-Object System.Windows.Controls.TextBlock -Property @{
-            Text   = 'Keyword Exclusions (sAMAccountName):'
-            Margin = '0,12,8,6'
-        }
-        [System.Windows.Controls.Grid]::SetRow($lblKeywords, 1)
-        $left.Children.Add($lblKeywords) | Out-Null
-
-        $keywordPanel = New-Object System.Windows.Controls.StackPanel
-        $keywordPanel.Margin = '0,0,0,0'
-        [System.Windows.Controls.Grid]::SetRow($keywordPanel, 2)
-        $left.Children.Add($keywordPanel) | Out-Null
-
-        $kwButtonPanel = New-Object System.Windows.Controls.StackPanel -Property @{
-            Orientation         = 'Horizontal'
-            HorizontalAlignment = 'Left'
-            Margin              = '0,6,0,0'
-        }
-        [System.Windows.Controls.Grid]::SetRow($kwButtonPanel, 3)
-        $left.Children.Add($kwButtonPanel) | Out-Null
-
-        $btnAddRule = New-Object System.Windows.Controls.Button -Property @{
-            Content = 'Add Rule'
-            Width   = 80
-        }
-        $btnClearEmpty = New-Object System.Windows.Controls.Button -Property @{
-            Content = 'Clear Empty'
-            Width   = 90
-            Margin  = '8,0,0,0'
-        }
-
-        $kwButtonPanel.Children.Add($btnAddRule)    | Out-Null
-        $kwButtonPanel.Children.Add($btnClearEmpty) | Out-Null
-
-        # Helper to add a keyword row
-        $addRuleScriptBlock = {
-            param($panel)
-
-            $rowPanel = New-Object System.Windows.Controls.StackPanel
-            $rowPanel.Orientation = 'Horizontal'
-            $rowPanel.Margin = '0,2,0,2'
-
-            $cmbType = New-Object System.Windows.Controls.ComboBox -Property @{
-                Width  = 100
-                Margin = '0,0,6,0'
-            }
-            'startswith','endswith','contains','equals' | ForEach-Object {
-                [void]$cmbType.Items.Add($_)
-            }
-            $cmbType.SelectedIndex = 0
-
-            $txtValue = New-Object System.Windows.Controls.TextBox -Property @{
-                Width = 180
-            }
-
-            $rowPanel.Children.Add($cmbType)  | Out-Null
-            $rowPanel.Children.Add($txtValue) | Out-Null
-
-            $panel.Children.Add($rowPanel)    | Out-Null
-        }
-
-        & $addRuleScriptBlock $keywordPanel  # initial row
-
-        $btnAddRule.Add_Click({
-            & $addRuleScriptBlock $keywordPanel
-        })
-
-        $btnClearEmpty.Add_Click({
-            $toKeep = New-Object System.Collections.Generic.List[object]
-            foreach ($child in $keywordPanel.Children) {
-                $txt = $child.Children[1]
-                if ($txt.Text.Trim()) {
-                    [void]$toKeep.Add($child)
-                }
-            }
-            $keywordPanel.Children.Clear()
-            foreach ($c in $toKeep) { $keywordPanel.Children.Add($c) | Out-Null }
-            if ($keywordPanel.Children.Count -eq 0) {
-                & $addRuleScriptBlock $keywordPanel
-            }
-        })
-
-        # ---------- LEFT: Password reset count ----------
-        $lblPwdCount = New-Object System.Windows.Controls.TextBlock -Property @{
-            Text   = 'Password Reset Count (per user):'
-            Margin = '0,12,8,6'
-        }
-        [System.Windows.Controls.Grid]::SetRow($lblPwdCount, 4)
-        $left.Children.Add($lblPwdCount) | Out-Null
-
-        $cmbPwdCount = New-Object System.Windows.Controls.ComboBox -Property @{
-            Margin = '0,12,0,6'
-            Width  = 80
-        }
-        [System.Windows.Controls.Grid]::SetRow($cmbPwdCount, 4)
-        [System.Windows.Controls.Grid]::SetColumn($cmbPwdCount, 1)
-        $left.Children.Add($cmbPwdCount) | Out-Null
-
-        1,2 | ForEach-Object { [void]$cmbPwdCount.Items.Add($_) }
-        $cmbPwdCount.SelectedItem = 1   # default to 1
-
-        # ---------- LEFT: Note ----------
-        $note = New-Object System.Windows.Controls.TextBlock -Property @{
-            Text = 'Note: Users in excluded OUs (including child OUs) and matching any ' +
-                   'keyword rule on sAMAccountName will be excluded. Special accounts ' +
-                   '(current user, MSOL, built-in admin, DSRM/DC/krbtgt/guest) are automatically excluded.'
-            TextWrapping = 'Wrap'
-            Margin       = '0,12,0,0'
-        }
-        [System.Windows.Controls.Grid]::SetRow($note, 5)
-        $left.Children.Add($note) | Out-Null
-
-        # ---------- RIGHT: OU TreeView with vertical scroll ----------
-        $lblOUs = New-Object System.Windows.Controls.TextBlock -Property @{
-            Text   = 'Excluded OUs (check to exclude; child OUs included):'
-            Margin = '0,0,0,6'
-        }
-        [System.Windows.Controls.Grid]::SetRow($lblOUs, 0)
-        $right.Children.Add($lblOUs) | Out-Null
-
-        $scrollOUs = New-Object System.Windows.Controls.ScrollViewer -Property @{
-            VerticalScrollBarVisibility   = 'Auto'
-            HorizontalScrollBarVisibility = 'Auto'
-            Height = 280
-        }
-        [System.Windows.Controls.Grid]::SetRow($scrollOUs, 1)
-        $right.Children.Add($scrollOUs) | Out-Null
-
-        $tvOUs = New-Object System.Windows.Controls.TreeView
-        $scrollOUs.Content = $tvOUs
-
-        # Helper: build OU tree from flat list
-        $buildOuTree = {
-            param(
-                [System.Windows.Controls.TreeView] $treeView,
-                [System.Collections.IEnumerable]   $ous,
-                [string]                          $domainNC
-            )
-
-            $treeView.Items.Clear()
-            $nodeIndex = @{}
-
-            # First create all nodes
-            foreach ($ou in $ous) {
-                $check = New-Object System.Windows.Controls.CheckBox
-                $check.Content = "$($ou.Name) [$($ou.DistinguishedName)]"
-                $check.Tag     = $ou.DistinguishedName
-
-                $item = New-Object System.Windows.Controls.TreeViewItem
-                $item.Header = $check
-                $item.Tag    = $ou.DistinguishedName
-
-                $nodeIndex[$ou.DistinguishedName] = $item
-            }
-
-            # Then attach them to parents
-            foreach ($ou in $ous) {
-                $item   = $nodeIndex[$ou.DistinguishedName]
-                $dn     = $ou.DistinguishedName
-                $dnParts = $dn -split ','
-
-                if ($dnParts.Length -gt 1) {
-                    # parent DN = everything after the first RDN (OU=/CN=)
-                    $parentDn = ($dnParts[1..($dnParts.Length - 1)]) -join ','
-                    if ($nodeIndex.ContainsKey($parentDn)) {
-                        [void]$nodeIndex[$parentDn].Items.Add($item)
-                    } else {
-                        # Parent is domain root or non-OU/container; make this a top-level node
-                        [void]$treeView.Items.Add($item)
-                    }
-                } else {
-                    [void]$treeView.Items.Add($item)
-                }
-            }
-        }
-
-        # Domain change => reload OU tree
-        $cmbDomain.Add_SelectionChanged({
-            if (-not $cmbDomain.SelectedItem) { return }
-            $domName = $cmbDomain.SelectedItem.ToString()
-            $dcs     = @($script:domainListView.Items)
-
-            $domainDC = $dcs |
-                Where-Object { $_.Domain -ieq $domName -and $_.Online } |
-                Select-Object -First 1
-
-            if (-not $domainDC) {
-                $tvOUs.Items.Clear()
-                return
-            }
-
-            $ous = Get-DomainOUsForDomain -DomainName $domName -DcList $dcs
-            & $buildOuTree $tvOUs $ous $domainDC.DefaultNamingContext
-        })
-
-        # Helper: recursively collect checked OU DNs
-        function Get-CheckedOuDns {
-            param(
-                [System.Collections.IEnumerable] $items,
-                [ref]$dnList
-            )
-
-            foreach ($it in $items) {
-                $header = $it.Header
-                if ($header -is [System.Windows.Controls.CheckBox]) {
-                    if ($header.IsChecked -eq $true -and $header.Tag) {
-                        $dnList.Value.Add([string]$header.Tag) | Out-Null
+    # Populate domains from discovered DCs (Forest Root -> Child Domain -> Tree Root -> other)
+    $domainOrder = @(
+        $script:domainListView.Items |
+            Where-Object { $_.Domain } |
+            Group-Object Domain |
+            ForEach-Object {
+                $rep = $_.Group | Select-Object -First 1
+                [PSCustomObject]@{
+                    Domain = $_.Name
+                    Type   = $rep.Type
+                    Order  = switch ($rep.Type) {
+                        'Forest Root'  { 1 }
+                        'Child Domain' { 2 }
+                        'Tree Root'    { 3 }
+                        default        { 4 }
                     }
                 }
-                if ($it.Items -and $it.Items.Count -gt 0) {
-                    Get-CheckedOuDns -items $it.Items -dnList $dnList
-                }
-            }
-        }
+            } |
+            Sort-Object Order, Domain
+    )
 
-        # ---------- Bottom buttons ----------
-        $bottomPanel = New-Object System.Windows.Controls.StackPanel -Property @{
-            Orientation         = 'Horizontal'
-            HorizontalAlignment = 'Right'
-            Margin              = '0,16,0,0'
-        }
-        [System.Windows.Controls.Grid]::SetRow($bottomPanel, 1)
-        [System.Windows.Controls.Grid]::SetColumnSpan($bottomPanel, 2)
-        $root.Children.Add($bottomPanel) | Out-Null
-
-        $btnStart = New-Object Wpf.Ui.Controls.Button -Property @{
-            Content = 'Start Reset'
-            Width   = 120
-        }
-        $btnCancel = New-Object System.Windows.Controls.Button -Property @{
-            Content = 'Cancel'
-            Width   = 80
-            Margin  = '8,0,0,0'
-        }
-
-        $bottomPanel.Children.Add($btnStart)  | Out-Null
-        $bottomPanel.Children.Add($btnCancel) | Out-Null
-
-        $dialog.Content = $root
-
-        $result = [PSCustomObject]@{
+    if (-not $domainOrder -or $domainOrder.Count -eq 0) {
+        $message = "No domains available for selection. Ensure forest discovery has completed."
+        Write-IdentIRLog -Message $message -TypeName 'Error'
+        Write-Host $message -ForegroundColor Red
+        [System.Windows.MessageBox]::Show($message, "Error", 'OK', 'Error') | Out-Null
+        return [PSCustomObject]@{
             Success            = $false
             Domain             = $null
             ExcludedOUs        = @()
             KeywordRules       = @()
             PasswordResetCount = 1
         }
+    }
 
-        $btnStart.Add_Click({
-            if (-not $cmbDomain.SelectedItem) {
-                $message = "No domain selected. Please select a domain."
-                Write-IdentIRLog -Message $message -TypeName 'Error'
-                Write-Host $message -ForegroundColor Red
-                [System.Windows.MessageBox]::Show($message, "Error", 'OK', 'Error') | Out-Null
-                return
+    $cmbDomain.Items.Clear()
+    foreach ($d in $domainOrder) {
+        [void]$cmbDomain.Items.Add($d.Domain)
+    }
+
+    # ---------- LEFT: Keyword rules ----------
+    $lblKeywords = New-Object System.Windows.Controls.TextBlock -Property @{
+        Text   = 'Keyword Exclusions (sAMAccountName):'
+        Margin = '0,12,8,6'
+    }
+    [System.Windows.Controls.Grid]::SetRow($lblKeywords, 1)
+    $left.Children.Add($lblKeywords) | Out-Null
+
+    $keywordPanel = New-Object System.Windows.Controls.StackPanel
+    $keywordPanel.Margin = '0,0,0,0'
+    [System.Windows.Controls.Grid]::SetRow($keywordPanel, 2)
+    $left.Children.Add($keywordPanel) | Out-Null
+
+    $kwButtonPanel = New-Object System.Windows.Controls.StackPanel -Property @{
+        Orientation         = 'Horizontal'
+        HorizontalAlignment = 'Left'
+        Margin              = '0,6,0,0'
+    }
+    [System.Windows.Controls.Grid]::SetRow($kwButtonPanel, 3)
+    $left.Children.Add($kwButtonPanel) | Out-Null
+
+    $btnAddRule = New-Object System.Windows.Controls.Button -Property @{
+        Content = 'Add Rule'
+        Width   = 80
+    }
+    $btnClearEmpty = New-Object System.Windows.Controls.Button -Property @{
+        Content = 'Clear Empty'
+        Width   = 90
+        Margin  = '8,0,0,0'
+    }
+
+    $kwButtonPanel.Children.Add($btnAddRule)    | Out-Null
+    $kwButtonPanel.Children.Add($btnClearEmpty) | Out-Null
+
+    # Helper to add a keyword row
+    $addRuleScriptBlock = {
+        param($panel)
+
+        $rowPanel = New-Object System.Windows.Controls.StackPanel
+        $rowPanel.Orientation = 'Horizontal'
+        $rowPanel.Margin = '0,2,0,2'
+
+        $cmbType = New-Object System.Windows.Controls.ComboBox -Property @{
+            Width  = 100
+            Margin = '0,0,6,0'
+        }
+        'startswith','endswith','contains','equals' | ForEach-Object {
+            [void]$cmbType.Items.Add($_)
+        }
+        $cmbType.SelectedIndex = 0
+
+        $txtValue = New-Object System.Windows.Controls.TextBox -Property @{
+            Width = 180
+        }
+
+        $rowPanel.Children.Add($cmbType)  | Out-Null
+        $rowPanel.Children.Add($txtValue) | Out-Null
+
+        $panel.Children.Add($rowPanel)    | Out-Null
+    }
+
+    & $addRuleScriptBlock $keywordPanel  # initial row
+
+    $btnAddRule.Add_Click({
+        & $addRuleScriptBlock $keywordPanel
+    })
+
+    $btnClearEmpty.Add_Click({
+        $toKeep = New-Object System.Collections.Generic.List[object]
+        foreach ($child in $keywordPanel.Children) {
+            $txt = $child.Children[1]
+            if ($txt.Text.Trim()) {
+                [void]$toKeep.Add($child)
             }
+        }
+        $keywordPanel.Children.Clear()
+        foreach ($c in $toKeep) { $keywordPanel.Children.Add($c) | Out-Null }
+        if ($keywordPanel.Children.Count -eq 0) {
+            & $addRuleScriptBlock $keywordPanel
+        }
+    })
 
-            $domainName = $cmbDomain.SelectedItem.ToString()
+    # ---------- LEFT: Password reset count ----------
+    $lblPwdCount = New-Object System.Windows.Controls.TextBlock -Property @{
+        Text   = 'Password Reset Count (per user):'
+        Margin = '0,12,8,6'
+    }
+    [System.Windows.Controls.Grid]::SetRow($lblPwdCount, 4)
+    $left.Children.Add($lblPwdCount) | Out-Null
 
-            # Collect OU DNs from checked TreeView nodes
-            $dnList = New-Object System.Collections.Generic.List[string]
-            Get-CheckedOuDns -items $tvOUs.Items -dnList ([ref]$dnList)
-            $ouDns = $dnList.ToArray()
+    $cmbPwdCount = New-Object System.Windows.Controls.ComboBox -Property @{
+        Margin = '0,12,0,6'
+        Width  = 80
+    }
+    [System.Windows.Controls.Grid]::SetRow($cmbPwdCount, 4)
+    [System.Windows.Controls.Grid]::SetColumn($cmbPwdCount, 1)
+    $left.Children.Add($cmbPwdCount) | Out-Null
 
-            # Collect keyword rules
-            $rules = @()
-            foreach ($row in $keywordPanel.Children) {
-                $cmb = $row.Children[0]
-                $txt = $row.Children[1]
+    1,2 | ForEach-Object { [void]$cmbPwdCount.Items.Add($_) }
+    $cmbPwdCount.SelectedItem = 1
 
-                $type  = $cmb.SelectedItem
-                $value = $txt.Text.Trim()
+    # ---------- LEFT: Note ----------
+    $note = New-Object System.Windows.Controls.TextBlock -Property @{
+        Text = 'Note: Users in excluded OUs (including child OUs) and matching any ' +
+               'keyword rule on sAMAccountName will be excluded. Special accounts ' +
+               '(current user, MSOL, built-in admin, DSRM/DC/krbtgt/guest) are automatically excluded.'
+        TextWrapping = 'Wrap'
+        Margin       = '0,12,0,0'
+    }
+    [System.Windows.Controls.Grid]::SetRow($note, 5)
+    $left.Children.Add($note) | Out-Null
 
-                if (-not $value) { continue }
-                if (-not $type) { $type = 'contains' }
+    # ---------- RIGHT: OU TreeView with vertical scroll ----------
+    $lblOUs = New-Object System.Windows.Controls.TextBlock -Property @{
+        Text   = 'Excluded OUs (check to exclude; child OUs included):'
+        Margin = '0,0,0,6'
+    }
+    [System.Windows.Controls.Grid]::SetRow($lblOUs, 0)
+    $right.Children.Add($lblOUs) | Out-Null
 
-                $rules += @{
-                    Type  = $type.ToLower()
-                    Value = $value
+    $scrollOUs = New-Object System.Windows.Controls.ScrollViewer -Property @{
+        VerticalScrollBarVisibility   = 'Auto'
+        HorizontalScrollBarVisibility = 'Auto'
+        Height = 280
+    }
+    [System.Windows.Controls.Grid]::SetRow($scrollOUs, 1)
+    $right.Children.Add($scrollOUs) | Out-Null
+
+    $tvOUs = New-Object System.Windows.Controls.TreeView
+    $scrollOUs.Content = $tvOUs
+
+    # Helper: build OU/container tree from flat list (dynamic, not hardcoded)
+    $buildOuTree = {
+        param(
+            [System.Windows.Controls.TreeView] $treeView,
+            [System.Collections.IEnumerable]   $ous,
+            [string]                          $domainNC
+        )
+
+        $treeView.Items.Clear()
+        if (-not $ous) { return }
+
+        $byDn = @{}
+        foreach ($o in $ous) {
+            if ($o.DistinguishedName) { $byDn[$o.DistinguishedName] = $o }
+        }
+
+        $childrenOf = @{}
+        foreach ($o in $ous) {
+            $dn = $o.DistinguishedName
+            if (-not $dn) { continue }
+
+            $parts = $dn -split ','
+            $parentDn = if ($parts.Length -gt 1) { ($parts[1..($parts.Length - 1)] -join ',') } else { '' }
+
+            if (-not $childrenOf.ContainsKey($parentDn)) {
+                $childrenOf[$parentDn] = New-Object System.Collections.Generic.List[string]
+            }
+            [void]$childrenOf[$parentDn].Add($dn)
+        }
+
+        function New-TreeItem {
+            param($entry)
+
+            $check = New-Object System.Windows.Controls.CheckBox
+            $check.Content = $entry.Name
+            $check.Tag     = $entry.DistinguishedName
+            $check.ToolTip = $entry.DistinguishedName
+
+            $item = New-Object System.Windows.Controls.TreeViewItem
+            $item.Header = $check
+            $item.Tag    = $entry.DistinguishedName
+            return $item
+        }
+
+        $culture = [System.Globalization.CultureInfo]::CurrentCulture
+
+        function Get-SortedChildDns {
+            param([System.Collections.Generic.List[string]]$dns)
+
+            return $dns | Sort-Object -Culture $culture -Property @{
+                Expression = {
+                    $e = $byDn[$_]
+                    if ($e -and $e.Name) { $e.Name } else { "" }
                 }
             }
+        }
 
-            # Password reset count from combo
-            $pwdCount = 1
-            if ($cmbPwdCount.SelectedItem) {
-                $pwdCount = [int]$cmbPwdCount.SelectedItem
+        function Add-Children {
+            param($parentItem, [string]$parentDn)
+
+            if (-not $childrenOf.ContainsKey($parentDn)) { return }
+
+            foreach ($childDn in (Get-SortedChildDns $childrenOf[$parentDn])) {
+                $childEntry = $byDn[$childDn]
+                if (-not $childEntry) { continue }
+
+                $childItem = New-TreeItem $childEntry
+                if ($null -eq $parentItem) { [void]$treeView.Items.Add($childItem) }
+                else { [void]$parentItem.Items.Add($childItem) }
+
+                Add-Children -parentItem $childItem -parentDn $childDn
+            }
+        }
+
+        $top = New-Object System.Collections.Generic.List[string]
+        foreach ($o in $ous) {
+            $dn = $o.DistinguishedName
+            if (-not $dn) { continue }
+
+            $parts = $dn -split ','
+            $parentDn = if ($parts.Length -gt 1) { ($parts[1..($parts.Length - 1)] -join ',') } else { '' }
+
+            if (-not $byDn.ContainsKey($parentDn)) { [void]$top.Add($dn) }
+        }
+
+        foreach ($dn in (Get-SortedChildDns $top)) {
+            $entry = $byDn[$dn]
+            if (-not $entry) { continue }
+
+            $item = New-TreeItem $entry
+            [void]$treeView.Items.Add($item)
+            Add-Children -parentItem $item -parentDn $dn
+        }
+    }
+
+    # Domain change => reload OU tree (per-domain, using same credentials used for discovery if available)
+    $cmbDomain.Add_SelectionChanged({
+        if (-not $cmbDomain.SelectedItem) { return }
+        $domName = $cmbDomain.SelectedItem.ToString()
+        $dcs     = @($script:domainListView.Items)
+
+        $domainDC = $dcs |
+            Where-Object { $_.Domain -ieq $domName -and $_.Online } |
+            Select-Object -First 1
+
+        if (-not $domainDC) {
+            $tvOUs.Items.Clear()
+            return
+        }
+
+        try {
+            $params = @{
+                DomainName = $domName
+                DcList     = $dcs
+            }
+            if ($script:ForestCredential) {
+                $params['Credential'] = $script:ForestCredential
             }
 
-            $result.Domain             = $domainName.ToLower()
-            $result.ExcludedOUs        = $ouDns
-            $result.KeywordRules       = $rules
-            $result.PasswordResetCount = $pwdCount
-            $result.Success            = $true
+            $ous = Get-DomainOUsForDomain @params
+            & $buildOuTree $tvOUs $ous $domainDC.DefaultNamingContext
+        } catch {
+            $tvOUs.Items.Clear()
+            $message = "Failed to load OU/container structure for ${domName}: $($_.Exception.Message)"
+            Write-IdentIRLog -Message $message -TypeName 'Error'
+            Write-Host $message -ForegroundColor Red
+            [System.Windows.MessageBox]::Show($message, "OU Load Error", 'OK', 'Error') | Out-Null
+        }
+    })
 
-            $message = "Mass Password Reset configured: Domain=$($result.Domain); " +
-                       "ExcludedOUs=$($ouDns -join ','); " +
-                       "KeywordRules=$($rules | ConvertTo-Json -Compress); " +
-                       "PasswordResetCount=$pwdCount"
-            Write-IdentIRLog -Message $message -TypeName 'Info'
-            Write-Host $message -ForegroundColor Green
+    function Get-CheckedOuDns {
+        param(
+            [System.Collections.IEnumerable] $items,
+            [ref]$dnList
+        )
 
-            $dialog.DialogResult = $true
-            $dialog.Close()
-        })
-
-        $btnCancel.Add_Click({
-            $dialog.DialogResult = $false
-            $dialog.Close()
-        })
-
-        $dialog.ShowDialog() | Out-Null
-        return $result
+        foreach ($it in $items) {
+            $header = $it.Header
+            if ($header -is [System.Windows.Controls.CheckBox]) {
+                if ($header.IsChecked -eq $true -and $header.Tag) {
+                    $dnList.Value.Add([string]$header.Tag) | Out-Null
+                }
+            }
+            if ($it.Items -and $it.Items.Count -gt 0) {
+                Get-CheckedOuDns -items $it.Items -dnList $dnList
+            }
+        }
     }
+
+    # ---------- Bottom buttons ----------
+    $bottomPanel = New-Object System.Windows.Controls.StackPanel -Property @{
+        Orientation         = 'Horizontal'
+        HorizontalAlignment = 'Right'
+        Margin              = '0,16,0,0'
+    }
+    [System.Windows.Controls.Grid]::SetRow($bottomPanel, 1)
+    [System.Windows.Controls.Grid]::SetColumnSpan($bottomPanel, 2)
+    $root.Children.Add($bottomPanel) | Out-Null
+
+    $btnStart = New-Object Wpf.Ui.Controls.Button -Property @{
+        Content = 'Start Reset'
+        Width   = 120
+    }
+    $btnCancel = New-Object System.Windows.Controls.Button -Property @{
+        Content = 'Cancel'
+        Width   = 80
+        Margin  = '8,0,0,0'
+    }
+
+    $bottomPanel.Children.Add($btnStart)  | Out-Null
+    $bottomPanel.Children.Add($btnCancel) | Out-Null
+
+    $dialog.Content = $root
+
+    $result = [PSCustomObject]@{
+        Success            = $false
+        Domain             = $null
+        ExcludedOUs        = @()
+        KeywordRules       = @()
+        PasswordResetCount = 1
+    }
+
+    $btnStart.Add_Click({
+        if (-not $cmbDomain.SelectedItem) {
+            $message = "No domain selected. Please select a domain."
+            Write-IdentIRLog -Message $message -TypeName 'Error'
+            Write-Host $message -ForegroundColor Red
+            [System.Windows.MessageBox]::Show($message, "Error", 'OK', 'Error') | Out-Null
+            return
+        }
+
+        $domainName = $cmbDomain.SelectedItem.ToString()
+
+        $dnList = New-Object System.Collections.Generic.List[string]
+        Get-CheckedOuDns -items $tvOUs.Items -dnList ([ref]$dnList)
+        $ouDns = $dnList.ToArray()
+
+        $rules = @()
+        foreach ($row in $keywordPanel.Children) {
+            $cmb = $row.Children[0]
+            $txt = $row.Children[1]
+
+            $type  = $cmb.SelectedItem
+            $value = $txt.Text.Trim()
+
+            if (-not $value) { continue }
+            if (-not $type) { $type = 'contains' }
+
+            $rules += @{
+                Type  = $type.ToLower()
+                Value = $value
+            }
+        }
+
+        $pwdCount = 1
+        if ($cmbPwdCount.SelectedItem) {
+            $pwdCount = [int]$cmbPwdCount.SelectedItem
+        }
+
+        $result.Domain             = $domainName.ToLower()
+        $result.ExcludedOUs        = $ouDns
+        $result.KeywordRules       = $rules
+        $result.PasswordResetCount = $pwdCount
+        $result.Success            = $true
+
+        $message = "Mass Password Reset configured: Domain=$($result.Domain); " +
+                   "ExcludedOUs=$($ouDns -join ','); " +
+                   "KeywordRules=$($rules | ConvertTo-Json -Compress); " +
+                   "PasswordResetCount=$pwdCount"
+        Write-IdentIRLog -Message $message -TypeName 'Info'
+        Write-Host $message -ForegroundColor Green
+
+        $dialog.DialogResult = $true
+        $dialog.Close()
+    })
+
+    $btnCancel.Add_Click({
+        $dialog.DialogResult = $false
+        $dialog.Close()
+    })
+
+    # Pre-select first domain and load OU tree once
+    if ($cmbDomain.Items.Count -gt 0) {
+        $cmbDomain.SelectedIndex = 0
+    }
+
+    $dialog.ShowDialog() | Out-Null
+    return $result
+}
 
     # ==========================
     # Right pane / main content
@@ -1498,147 +1821,4 @@ function Invoke-WinUI {
 
     [void]$form.ShowDialog()
     $form = $null
-}
-
-function Set-CurrentPassword {
-    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
-    param (
-        [System.Management.Automation.PSCredential] $Credential,
-        [switch] $Execute,
-        [SecureString] $Password
-    )
-    $oldConfirm = $script:ConfirmPreference
-    $script:ConfirmPreference = 'None'
-    $oldWhatIf = $WhatIfPreference
-    $WhatIfPreference = -not [bool]$Execute
-    try {
-        $ErrorActionPreference = 'Stop'
-        Set-StrictMode -Version Latest
-        # Current session identity
-        $currentUsername = $env:USERNAME
-        if (-not $currentUsername) {
-            Write-IdentIRLog -Message 'Unable to determine the currently logged-on username.' -TypeName 'Error' -ForegroundColor Red
-            return $false
-        }
-        # Authenticating DC (LOGONSERVER)
-        $logonServerNetBIOS = $env:LOGONSERVER -replace '^\\\\',''
-        if (-not $logonServerNetBIOS) {
-            Write-IdentIRLog -Message 'Unable to determine the authenticating domain controller (LOGONSERVER).' -TypeName 'Error' -ForegroundColor Red
-            return $false
-        }
-        # FQDN (fallback to NetBIOS)
-        try { $logonServerFQDN = [System.Net.Dns]::GetHostEntry($logonServerNetBIOS).HostName }
-        catch { $logonServerFQDN = $logonServerNetBIOS; Write-IdentIRLog -Message "FQDN resolution failed for '$logonServerNetBIOS'; using NetBIOS." -TypeName 'Warning' -ForegroundColor Yellow }
-        # RootDSE: ensure sync; get domain DN
-        $rootDSEPath = "LDAP://$logonServerFQDN/RootDSE"
-        $rootDSE = if ($Credential) {
-            New-Object System.DirectoryServices.DirectoryEntry($rootDSEPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
-        } else { [ADSI]$rootDSEPath }
-        if ($rootDSE.Properties['isSynchronized'][0] -ne $true) {
-            Write-IdentIRLog -Message "Authenticating DC '$logonServerFQDN' is not synchronized." -TypeName 'Error' -ForegroundColor Red
-            return $false
-        }
-        $domainDN = $rootDSE.Properties['defaultNamingContext'][0]
-        if (-not $domainDN) {
-            Write-IdentIRLog -Message "defaultNamingContext missing on '$logonServerFQDN'." -TypeName 'Error' -ForegroundColor Red
-            return $false
-        }
-        $domainName = ($domainDN -replace 'DC=','' -replace ',', '.')
-        Write-IdentIRLog -Message "Identified session: User='$currentUsername', Domain='$domainName', DC='$logonServerFQDN' (WhatIf=$WhatIfPreference)" -TypeName 'Info' -ForegroundColor Cyan
-        # Locate current user
-        $searchRootPath = "LDAP://$logonServerFQDN/$domainDN"
-        $searchRoot = if ($Credential) {
-            New-Object System.DirectoryServices.DirectoryEntry($searchRootPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
-        } else { [ADSI]$searchRootPath }
-        $ds = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
-        $ds.Filter = "(&(objectClass=user)(sAMAccountName=$currentUsername))"
-        $ds.PageSize = 1
-        $ds.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
-        $res = $ds.FindOne()
-        if (-not $res) {
-            Write-IdentIRLog -Message "User '$currentUsername' not found in '$domainName'." -TypeName 'Error' -ForegroundColor Red
-            return $false
-        }
-        $userDN = $res.Properties['distinguishedName'][0]
-        $userPath = "LDAP://$logonServerFQDN/$userDN"
-        $userDE = if ($Credential) {
-            New-Object System.DirectoryServices.DirectoryEntry($userPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
-        } else { [ADSI]$userPath }
-        $confirmTarget = "$userDN on $logonServerFQDN"
-        # WhatIf: emit native line but don't treat as cancel
-        if ($WhatIfPreference) {
-            $null = $PSCmdlet.ShouldProcess($confirmTarget, "Reset password for current user")
-            Write-IdentIRLog -Message "[WhatIf] Would reset password for '$currentUsername' in '$domainName'." -TypeName 'Info' -ForegroundColor Green
-            return $true
-        }
-        if (-not $PSCmdlet.ShouldProcess($confirmTarget, "Reset password for current user")) {
-            Write-IdentIRLog -Message "Operation cancelled." -TypeName 'Warning' -ForegroundColor Yellow
-            return $false
-        }
-        $newSecure = $null
-        if ($Password) {
-            $newSecure = $Password
-        } else {
-            while ($true) {
-                $p1 = Read-Host "Enter a new password for '$currentUsername'" -AsSecureString
-                $p2 = Read-Host "Re-enter the new password for '$currentUsername'" -AsSecureString
-                $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1)
-                $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2)
-                $s1 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b1)
-                $s2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b2)
-                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1)
-                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2)
-                if ($s1 -ne $s2) { Write-Warning "Passwords do not match. Try again."; continue }
-                $newSecure = $p1
-                # Clear plaintext copies
-                $s1 = $null; $s2 = $null
-                break
-            }
-        }
-        # Convert to plaintext ONLY for the call, then zero it
-        $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($newSecure)
-        $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b)
-        $ok = $false
-        for ($i=1; $i -le 2; $i++) {
-            try {
-                # IMPORTANT: Invoke SetPassword with a *string* argument
-                $userDE.psbase.Invoke('SetPassword', @($plain))
-                # Optional but harmless:
-                $userDE.CommitChanges()
-                $ok = $true
-                break
-            } catch {
-                if ($i -eq 2) {
-                    Write-IdentIRLog -Message "Password reset failed for '$currentUsername' on '$logonServerFQDN': $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
-                    return $false
-                }
-                Start-Sleep -Milliseconds 400
-            }
-        }
-        if ($b) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
-        $plain = $null
-        # Purge Kerberos tickets (best-effort)
-        try {
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = 'klist'
-            $psi.Arguments = 'purge'
-            $psi.UseShellExecute = $false
-            $psi.RedirectStandardOutput = $true
-            $psi.CreateNoWindow = $true
-            $p = [System.Diagnostics.Process]::Start($psi); $p.WaitForExit(); $p.Dispose()
-            Write-IdentIRLog -Message 'Kerberos tickets purged.' -TypeName 'Info' -ForegroundColor Gray
-        } catch {
-            Write-IdentIRLog -Message 'Kerberos ticket purge encountered a non-critical error.' -TypeName 'Warning' -ForegroundColor Yellow
-        }
-        Write-IdentIRLog -Message "Password reset completed for '$currentUsername' in '$domainName'." -TypeName 'Info' -ForegroundColor Green
-        return $true
-    }
-    catch {
-        Write-IdentIRLog -Message "Set-CurrentPassword error: $($_.Exception.Message)" -TypeName 'Error' -ForegroundColor Red
-        return $false
-    }
-    finally {
-        $script:ConfirmPreference = $oldConfirm
-        $WhatIfPreference = $oldWhatIf
-    }
 }
